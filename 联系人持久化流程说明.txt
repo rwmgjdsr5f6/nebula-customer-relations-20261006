@@ -1,0 +1,274 @@
+联系人新增与查询持久化流程说明
+================================
+
+适用对象：task003 目录下的 crm.py（Python 3 标准库 + SQLite）。
+本文件只解释既有实现，不改变程序、数据库结构、测试和 README 的任何行为。
+
+重要核对约定
+------------
+下文“固定例子”中的全部命令与 JSON 均为依据源码推导出的预期结果，
+本次交付并未在父目录的 contacts.sqlite3 上实际执行这些命令，因此不声称
+它们已经运行成功。验收时请在 task003 目录按顺序亲自执行核对。
+预期编号 1、2、3 有一个前提：contacts.sqlite3 在本组命令开始前是一个
+不含任何联系人的新库（表为空）。若表中已有记录，编号会在已有最大值之后
+继续递增，不再从 1 开始。
+
+一、执行顺序总览
+----------------
+一次 add（新增联系人）从命令行到 JSON 输出，严格按以下五步执行：
+
+  1. 参数解析   build_parser / main（crm.py:119、crm.py:138）
+  2. 字段清理与校验  clean / valid_email / fail（crm.py:34、39、28）
+  3. 数据库初始化 connect_db（crm.py:54）
+  4. 提交写入   INSERT + commit（cmd_add，crm.py:78-82）
+  5. JSON 输出  json.dumps（cmd_add，crm.py:86-92）
+
+list（按公司查询）同样是 1、2、3 三步进入数据库，只是第 4 步改为
+SELECT（cmd_list，crm.py:103-107），第 5 步输出 JSON 数组
+（cmd_list，crm.py:111-115）。
+
+任一步校验失败都会在进入下一步之前终止进程，因此拒绝输入不可能走到
+数据库写入，详见第五节。
+
+二、逐步说明
+------------
+
+第 1 步：参数解析（build_parser，crm.py:119-135；main，crm.py:138-141）
+
+- --db 是定义在主解析器上的全局必填参数（crm.py:121），因此命令行中
+  必须写在子命令 add 或 list 之前，形式为：
+      python crm.py --db 数据库路径 add ...
+      python crm.py --db 数据库路径 list ...
+  若把 --db 放到 add/list 之后，argparse 会报
+  “error: the following arguments are required: --db”，
+  以退出码 2 结束，且标准输出为空。
+- add 子命令必填 --name、--email、--company（crm.py:126-128）；
+  list 子命令必填 --company（crm.py:132）。
+- main 调用 parser.parse_args 解析参数（crm.py:140），再通过
+  args.func 分派给 cmd_add 或 cmd_list（crm.py:141）。
+
+第 2 步：字段清理与校验（cmd_add，crm.py:65-74）
+
+- 三个字段先各自经过 clean（crm.py:34-36），即 value.strip()：
+  只去掉首尾空白，内部字符（含内部空格）和大小写原样保留。
+  例如 “  Lin@Example.Test  ” 清理后为 “Lin@Example.Test”。
+- 随后按固定顺序校验，前一项不过就不再检查后一项：
+  1) 姓名清理后为空：fail("name", "must not be empty")（crm.py:69-70）
+  2) 邮箱不合法：fail("email", "invalid email address")（crm.py:71-72）
+  3) 公司清理后为空：fail("company", "must not be empty")（crm.py:73-74）
+- 邮箱规则见 valid_email（crm.py:39-51）：不含任何空白字符；恰好一个
+  @；@ 两侧均非空；域名按点分段后至少两段且每段都非空。
+  lin.example.test 因为没有 @ 而不合法。
+- fail（crm.py:28-31）把 “字段: 消息” 打印到标准错误，然后
+  sys.exit(2) 立即结束进程；它不向标准输出写任何内容。
+- 注意：以上全部校验都发生在 connect_db 调用（crm.py:76）之前，
+  也就是说字段不合法时数据库连接尚未打开。
+
+第 3 步：数据库初始化（connect_db，crm.py:54-61）
+
+- 先用 Path(db_path).parent.is_dir() 检查父目录是否存在
+  （crm.py:56）；不存在则 fail("db", "parent directory does not
+  exist")（crm.py:57），退出码 2。此检查位于 sqlite3.connect 之前，
+  程序本身也不会创建缺失的目录。
+- 父目录存在时 sqlite3.connect(db_path)（crm.py:58）打开数据库文件；
+  文件不存在会由 SQLite 自动创建空文件，文件已存在则直接复用。
+- 紧接着执行 CREATE TABLE IF NOT EXISTS contacts（SQL 常量见
+  crm.py:18-25）并 commit（crm.py:59-60）。表结构为：
+    id      INTEGER PRIMARY KEY AUTOINCREMENT（自增主键）
+    name    TEXT NOT NULL
+    email   TEXT NOT NULL
+    company TEXT NOT NULL
+  IF NOT EXISTS 保证复用已有数据库时不会清空或改动既有数据。
+
+第 4 步：提交写入（cmd_add，crm.py:78-82）
+
+- 执行参数化 INSERT：
+    INSERT INTO contacts (name, email, company) VALUES (?, ?, ?)
+  清理后的三个值作为参数绑定（crm.py:78-81），不做额外改写。
+- conn.commit()（crm.py:82）提交事务，记录在此刻真正落盘到数据库
+  文件；随后 conn.close()（crm.py:83-84）关闭连接。
+- 新行的 id 由 SQLite 的 AUTOINCREMENT 分配，代码通过
+  cursor.lastrowid 取回（crm.py:87）。全新空表上第一次插入得到 1，
+  同一连接之后依次为 2、3；跨进程时由于每次都已 commit，编号同样
+  连续递增。
+
+第 5 步：JSON 输出（cmd_add，crm.py:86-92）
+
+- 组装包含 id、name、email、company 四个键的记录字典，
+  json.dumps(..., ensure_ascii=False) 输出紧凑单行 JSON（键值之间
+  无多余空格），中文不转义，打印到标准输出，退出码 0。
+- list 则输出记录数组；查询 SQL（cmd_list，crm.py:103-107）为
+    SELECT id, name, email, company
+    FROM contacts WHERE company = ? ORDER BY id ASC
+  即公司名精确相等匹配，结果按编号升序。未匹配到任何公司时输出 []。
+  list 也会先清理并校验公司名（cmd_list，crm.py:97-99），公司为空白
+  时同样以 “company: must not be empty”、退出码 2 拒绝。
+
+三、固定例子（预期结果，未随本次交付执行）
+------------------------------------------
+
+执行位置：task003 目录。
+数据库：父目录中新建的 ../contacts.sqlite3（若文件尚不存在，第一条
+add 会在第 3 步自动创建它；本组例子假设其 contacts 表初始为空）。
+每条 python crm.py 都是相互独立的操作系统进程，只是反复打开同一个
+数据库文件。
+
+例 1：新增林宁（星河科技）。三个字段故意带首尾空白，演示 clean：
+
+  python crm.py --db ../contacts.sqlite3 add \
+      --name "  林宁  " --email "  lin@example.test  " \
+      --company "  星河科技  "
+
+  退出码：0
+  预期标准输出（单行）：
+  {"id": 1, "name": "林宁", "email": "lin@example.test", "company": "星河科技"}
+
+例 2：新增许禾（星河科技）：
+
+  python crm.py --db ../contacts.sqlite3 add \
+      --name "许禾" --email "xu@example.test" --company "星河科技"
+
+  退出码：0
+  预期标准输出（单行）：
+  {"id": 2, "name": "许禾", "email": "xu@example.test", "company": "星河科技"}
+
+例 3：新增周岚（远帆咨询）：
+
+  python crm.py --db ../contacts.sqlite3 add \
+      --name "周岚" --email "zhou@example.test" --company "远帆咨询"
+
+  退出码：0
+  预期标准输出（单行）：
+  {"id": 3, "name": "周岚", "email": "zhou@example.test", "company": "远帆咨询"}
+
+例 4：查询星河科技，只返回林宁、许禾两人，按 id 升序：
+
+  python crm.py --db ../contacts.sqlite3 list --company "星河科技"
+
+  退出码：0
+  预期标准输出（单行数组）：
+  [{"id": 1, "name": "林宁", "email": "lin@example.test", "company": "星河科技"}, {"id": 2, "name": "许禾", "email": "xu@example.test", "company": "星河科技"}]
+
+例 5：查询远帆咨询，只返回周岚一人：
+
+  python crm.py --db ../contacts.sqlite3 list --company "远帆咨询"
+
+  退出码：0
+  预期标准输出（单行数组）：
+  [{"id": 3, "name": "周岚", "email": "zhou@example.test", "company": "远帆咨询"}]
+
+例 6：查询一个不存在的公司，精确匹配无结果，返回空数组：
+
+  python crm.py --db ../contacts.sqlite3 list --company "不存在的公司"
+
+  退出码：0
+  预期标准输出：
+  []
+
+为什么独立进程的查询仍能读到之前新增的记录：
+- 每次 add 在进程结束前都执行了 conn.commit()（cmd_add，crm.py:82），
+  插入的行被提交并写入磁盘上同一个 ../contacts.sqlite3 文件，而非停留
+  在某个进程的内存或未提交事务中。
+- 后续 list 是新进程，用同一路径再次 sqlite3.connect（connect_db，
+  crm.py:58）打开该文件，SELECT 看到的是该文件中此前所有已提交事务的
+  结果，因此能查到编号 1、2、3。未 commit 的数据对其他连接不可见；
+  本例每条 add 都已 commit，所以不存在这个问题。
+
+四、空白、大小写与精确匹配的边界
+--------------------------------
+
+- 只去首尾空白：strip 不触碰内部字符。例 1 中保存的值不含首尾空格；
+  若传入 “林 宁”，中间的空格会保留为 “林 宁”。
+- 大小写保留：程序不做大小写规范化，邮箱 “Lin@Example.Test” 会按原样
+  存储和回显。
+- 公司筛选是精确匹配：SQL 用 WHERE company = ?（cmd_list，
+  crm.py:105）。“星河” 不会匹配 “星河科技”；大小写或任何字符不同都
+  视为不同公司，匹配不上时输出 []。
+- 查询参数 --company 同样先 clean，因此 list --company " 星河科技 "
+  与 list --company "星河科技" 等价；但纯空白公司名会被拒绝。
+
+五、输入被拒绝时的行为（预期结果，未随本次交付执行）
+----------------------------------------------------
+
+以下各例的共同结果：退出码 2、标准输出为空、标准错误恰好为所注一行。
+拒绝由 fail（crm.py:28-31）发出，发生在 connect_db（crm.py:76 /
+crm.py:101）之前，所以不会执行任何 SQL。
+
+例 7：空白姓名（对已存在的 ../contacts.sqlite3 执行）：
+
+  python crm.py --db ../contacts.sqlite3 add \
+      --name "   " --email "lin@example.test" --company "星河科技"
+
+  退出码：2
+  预期标准输出：（空）
+  预期标准错误：name: must not be empty
+
+例 8：无效邮箱 lin.example.test（没有 @）。这里指向一个尚不存在的
+新库 ../fresh.sqlite3：
+
+  python crm.py --db ../fresh.sqlite3 add \
+      --name "林宁" --email "lin.example.test" --company "星河科技"
+
+  退出码：2
+  预期标准输出：（空）
+  预期标准错误：email: invalid email address
+
+  因为邮箱校验（crm.py:71-72）在打开数据库（crm.py:76）之前失败，
+  sqlite3.connect 根本没有执行：预期 ../fresh.sqlite3 及其 SQLite
+  伴随文件都不会被创建。
+
+例 9：空白公司：
+
+  python crm.py --db ../contacts.sqlite3 add \
+      --name "林宁" --email "lin@example.test" --company "  "
+
+  退出码：2
+  预期标准输出：（空）
+  预期标准错误：company: must not be empty
+
+例 10：多个字段同时无效时，只报告校验顺序中的第一个错误
+（姓名 → 邮箱 → 公司，crm.py:69-74）：
+
+  python crm.py --db ../fresh.sqlite3 add \
+      --name " " --email "bad" --company " "
+
+  预期标准错误只有：name: must not be empty（不会再报邮箱或公司）
+
+  姓名有效、邮箱和公司都无效时，则只报邮箱：
+
+  python crm.py --db ../fresh.sqlite3 add \
+      --name "林宁" --email "bad" --company " "
+
+  预期标准错误只有：email: invalid email address
+
+已有记录为何保持不变：
+- 对已存在的 ../contacts.sqlite3 执行例 7、例 9 这类被拒绝的命令时，
+  进程在第 2 步就 sys.exit(2)，既没有打开连接执行 INSERT，也没有
+  commit，库文件内容不发生任何变化。拒绝后再执行
+  list --company "星河科技"，预期仍只返回编号 1、2 两条；
+  list --company "远帆咨询" 仍只返回编号 3 一条。
+
+例 11：字段全部有效，但数据库父目录不存在：
+
+  python crm.py --db ../no-such-dir/contacts.sqlite3 add \
+      --name "林宁" --email "lin@example.test" --company "星河科技"
+
+  退出码：2
+  预期标准输出：（空）
+  预期标准错误：db: parent directory does not exist
+
+  依据 connect_db（crm.py:56-57）：父目录检查先于 sqlite3.connect，
+  失败即退出，预期目录 ../no-such-dir 和数据库文件都不会被创建。
+
+六、源码函数索引
+----------------
+
+  build_parser  命令行结构与 --db 全局位置  crm.py:119-135
+  main          解析参数并分派到子命令处理   crm.py:138-141
+  clean         去首尾空白，保留内部与大小写 crm.py:34-36
+  valid_email   邮箱合法性规则              crm.py:39-51
+  fail          标准错误报错并以退出码 2 退出 crm.py:28-31
+  connect_db    父目录检查、连接/建表初始化  crm.py:54-61
+  cmd_add       清理校验、INSERT、commit、输出 crm.py:64-93
+  cmd_list      清理校验、精确查询、数组输出  crm.py:96-116
+  CREATE_TABLE_SQL  contacts 表结构定义      crm.py:18-25
