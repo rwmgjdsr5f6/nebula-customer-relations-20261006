@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """本地客户关系管理台命令行入口。
 
-仅支持两个行为：
-- add:  新增联系人
-- list: 按公司名精确筛选联系人
+仅支持三个行为：
+- add:          新增联系人
+- list:         按公司名精确筛选联系人
+- update-email: 按编号更新联系人邮箱
 
 数据持久化在通过 --db 指定的 SQLite 数据库文件中，
 文件不存在时自动初始化，已存在则复用。
@@ -93,6 +94,47 @@ def cmd_add(args):
     return 0
 
 
+def cmd_update_email(args):
+    raw_id = clean(args.id)
+    email = clean(args.email)
+
+    if (
+        not raw_id
+        or not all("0" <= ch <= "9" for ch in raw_id)
+        or not 1 <= int(raw_id) <= 9223372036854775807
+    ):
+        fail("id", "must be a positive integer")
+    contact_id = int(raw_id)
+
+    if not valid_email(email):
+        fail("email", "invalid email address")
+
+    conn = connect_db(args.db)
+    try:
+        row = conn.execute(
+            "SELECT id, name, email, company FROM contacts WHERE id = ?",
+            (contact_id,),
+        ).fetchone()
+        if row is None:
+            fail("id", "contact not found")
+        conn.execute(
+            "UPDATE contacts SET email = ? WHERE id = ?",
+            (email, contact_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    record = {
+        "id": row[0],
+        "name": row[1],
+        "email": email,
+        "company": row[3],
+    }
+    print(json.dumps(record, ensure_ascii=False))
+    return 0
+
+
 def cmd_list(args):
     company = clean(args.company)
     if not company:
@@ -131,6 +173,11 @@ def build_parser():
     parser_list = subparsers.add_parser("list", help="按公司筛选联系人")
     parser_list.add_argument("--company", required=True, help="公司名")
     parser_list.set_defaults(func=cmd_list)
+
+    parser_update = subparsers.add_parser("update-email", help="按编号更新邮箱")
+    parser_update.add_argument("--id", required=True, help="联系人编号")
+    parser_update.add_argument("--email", required=True, help="新邮箱")
+    parser_update.set_defaults(func=cmd_update_email)
 
     return parser
 
