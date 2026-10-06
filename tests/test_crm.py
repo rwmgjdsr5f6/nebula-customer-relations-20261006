@@ -309,6 +309,219 @@ class CRMTestCase(unittest.TestCase):
         self.assertFalse(missing_parent.exists())
         self.assertFalse(fresh_db.exists())
 
+    # ---- list --name 姓名子串筛选的回归测试 ----
+
+    def seed_name_filter_contacts(self):
+        """按固定顺序新增五名联系人，返回各自的新增结果字典。"""
+        zhoulin = self.assert_add_success(
+            self.add_contact(self.db_path, "周林", "c1@example.test", "星河科技"),
+            {"name": "周林", "email": "c1@example.test", "company": "星河科技"},
+        )
+        linning = self.assert_add_success(
+            self.add_contact(self.db_path, "林宁", "c2@example.test", "星河科技"),
+            {"name": "林宁", "email": "c2@example.test", "company": "星河科技"},
+        )
+        lin_literal = self.assert_add_success(
+            self.add_contact(self.db_path, "Lin_%", "c3@example.test", "星河科技"),
+            {"name": "Lin_%", "email": "c3@example.test", "company": "星河科技"},
+        )
+        other_linning = self.assert_add_success(
+            self.add_contact(self.db_path, "林宁", "c4@example.test", "远帆咨询"),
+            {"name": "林宁", "email": "c4@example.test", "company": "远帆咨询"},
+        )
+        other_linab = self.assert_add_success(
+            self.add_contact(self.db_path, "linAB", "c5@example.test", "远帆咨询"),
+            {"name": "linAB", "email": "c5@example.test", "company": "远帆咨询"},
+        )
+        self.assertLess(zhoulin["id"], linning["id"])
+        self.assertLess(linning["id"], lin_literal["id"])
+        self.assertLess(lin_literal["id"], other_linning["id"])
+        self.assertLess(other_linning["id"], other_linab["id"])
+        return zhoulin, linning, lin_literal, other_linning, other_linab
+
+    def list_name(self, db_path, company, name):
+        """以独立子进程执行 list --company --name（--db 仍在子命令之前）。"""
+        return self.run_crm(
+            db_path, "list", "--company", company, "--name", name
+        )
+
+    def assert_name_list_success(self, company, name, expected_records):
+        """断言带 --name 的 list 成功且返回记录（含顺序）与期望完全一致。"""
+        result = self.list_name(self.db_path, company, name)
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8"))
+        self.assertEqual(result.stderr, b"")
+        records = json.loads(result.stdout.decode("utf-8"))
+        self.assertIsInstance(records, list)
+        for record in records:
+            self.assertEqual(set(record.keys()), {"id", "name", "email", "company"})
+            self.assertIsInstance(record["id"], int)
+        self.assertEqual(records, expected_records)
+        return records
+
+    def test_list_name_substring_returns_matches_sorted_by_id_within_company(self):
+        zhoulin, linning, _lin_literal, other_linning, _other_linab = (
+            self.seed_name_filter_contacts()
+        )
+
+        # “林”只命中星河科技的周林和林宁，按 add 返回编号升序
+        records = self.assert_name_list_success("星河科技", "林", [zhoulin, linning])
+        self.assertEqual(
+            [r["id"] for r in records], [zhoulin["id"], linning["id"]]
+        )
+        # 不包含远帆咨询的同名记录
+        self.assertNotIn(other_linning["id"], [r["id"] for r in records])
+        self.assertTrue(all(r["company"] == "星河科技" for r in records))
+
+        # 远帆咨询的“林”只命中远帆的林宁，两家公司互不串扰
+        self.assert_name_list_success("远帆咨询", "林", [other_linning])
+        # 未录入公司即使给出姓名也返回空数组
+        self.assert_name_list_success("未录入公司", "林", [])
+
+    def test_list_name_ignores_surrounding_whitespace_in_company_and_name(self):
+        zhoulin, linning, _lin_literal, _other_linning, _other_linab = (
+            self.seed_name_filter_contacts()
+        )
+
+        # 公司名和姓名条件首尾带空格或制表符时，结果与不带空白时相同
+        for company, name in (
+            ("  星河科技  ", "  林  "),
+            ("\t星河科技\t", "\t林\t"),
+            (" \t星河科技 \t", " \t林 \t"),
+            ("  星河科技", "林  "),
+            ("星河科技  ", "  林"),
+        ):
+            with self.subTest(company=company, name=name):
+                self.assert_name_list_success(company, name, [zhoulin, linning])
+
+    def test_list_without_name_returns_all_records_of_company(self):
+        zhoulin, linning, lin_literal, other_linning, other_linab = (
+            self.seed_name_filter_contacts()
+        )
+
+        # 省略 --name 时返回星河科技全部三条，仍按编号升序
+        self.assert_list_success(
+            self.db_path, "星河科技", [zhoulin, linning, lin_literal]
+        )
+        # 远帆咨询的两条不受影响
+        self.assert_list_success(
+            self.db_path, "远帆咨询", [other_linning, other_linab]
+        )
+
+    def test_list_name_substring_is_case_sensitive(self):
+        _zhoulin, _linning, lin_literal, _other_linning, other_linab = (
+            self.seed_name_filter_contacts()
+        )
+
+        # Lin 只命中实际含该子串的 Lin_%；小写 lin 在星河科技无命中
+        self.assert_name_list_success("星河科技", "Lin", [lin_literal])
+        self.assert_name_list_success("星河科技", "lin", [])
+        # 远帆咨询内小写 lin 命中 linAB，大写 Lin 无命中
+        self.assert_name_list_success("远帆咨询", "lin", [other_linab])
+        self.assert_name_list_success("远帆咨询", "Lin", [])
+
+    def test_list_name_percent_and_underscore_are_literal_substrings(self):
+        _zhoulin, _linning, lin_literal, _other_linning, _other_linab = (
+            self.seed_name_filter_contacts()
+        )
+
+        # % 与 _ 保持字面子串语义：只命中实际含该字符的 Lin_%，
+        # 不会像通配符那样命中全部记录
+        for symbol in ("%", "_", "Lin_%"):
+            with self.subTest(symbol=symbol):
+                self.assert_name_list_success("星河科技", symbol, [lin_literal])
+                self.assert_name_list_success("远帆咨询", symbol, [])
+
+    def test_list_name_without_match_returns_empty_array(self):
+        self.seed_name_filter_contacts()
+
+        for name in ("无此姓名", "X9", "周林宁"):
+            with self.subTest(name=name):
+                self.assert_name_list_success("星河科技", name, [])
+
+    def test_list_name_success_output_is_a_single_json_array(self):
+        zhoulin, linning, _lin_literal, _other_linning, _other_linab = (
+            self.seed_name_filter_contacts()
+        )
+
+        result = self.list_name(self.db_path, "星河科技", "林")
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8"))
+        self.assertEqual(result.stderr, b"")
+
+        text = result.stdout.decode("utf-8")
+        # 标准输出整体只包含一个 JSON 数组，print 追加恰好一个换行
+        self.assertTrue(text.endswith("\n"))
+        self.assertEqual(text.count("\n"), 1)
+        records = json.loads(text)
+        self.assertIsInstance(records, list)
+        self.assertEqual(records, [zhoulin, linning])
+        # 每条记录只含四个字段，字段值与新增结果一致
+        for record in records:
+            self.assertEqual(set(record.keys()), {"id", "name", "email", "company"})
+            self.assertIsInstance(record["id"], int)
+
+    def test_list_empty_or_blank_name_is_rejected(self):
+        self.seed_name_filter_contacts()
+
+        for name in ("", "   ", "\t\t", " \t "):
+            with self.subTest(name=name):
+                result = self.list_name(self.db_path, "星河科技", name)
+                self.assert_list_rejected(result, "name: must not be empty")
+
+    def test_list_empty_company_and_name_reports_only_company_error(self):
+        self.seed_name_filter_contacts()
+
+        # 公司和姓名同时为空时，只报告 company 错误，退出码与输出通道规则不变
+        for company, name in (
+            ("", ""),
+            ("   ", "  "),
+            ("\t\t", " \t "),
+        ):
+            with self.subTest(company=company, name=name):
+                result = self.list_name(self.db_path, company, name)
+                self.assert_list_rejected(result, "company: must not be empty")
+
+    def test_list_invalid_name_leaves_existing_records_unchanged(self):
+        zhoulin, linning, lin_literal, other_linning, other_linab = (
+            self.seed_name_filter_contacts()
+        )
+
+        # 姓名无效、公司有效：只报告姓名错误
+        for name in ("", "   ", "\t\t", " \t "):
+            with self.subTest(name=name):
+                result = self.list_name(self.db_path, "星河科技", name)
+                self.assert_list_rejected(result, "name: must not be empty")
+
+                # 拒绝查询后两家公司记录的数量和字段均不变
+                self.assert_list_success(
+                    self.db_path, "星河科技", [zhoulin, linning, lin_literal]
+                )
+                self.assert_list_success(
+                    self.db_path, "远帆咨询", [other_linning, other_linab]
+                )
+
+        # 公司与姓名同时无效：只报告公司错误，记录同样不变
+        result = self.list_name(self.db_path, "  ", "\t")
+        self.assert_list_rejected(result, "company: must not be empty")
+        self.assert_list_success(
+            self.db_path, "星河科技", [zhoulin, linning, lin_literal]
+        )
+        self.assert_list_success(
+            self.db_path, "远帆咨询", [other_linning, other_linab]
+        )
+
+    def test_list_invalid_name_does_not_create_missing_database(self):
+        for index, name in enumerate(("", "   ", "\t\t", " \t ")):
+            fresh_db = self.tmpdir / f"list-name-fresh-{index}.sqlite3"
+            with self.subTest(name=name):
+                # 父目录已存在，但数据库文件尚不存在
+                self.assertTrue(self.tmpdir.is_dir())
+                self.assertFalse(fresh_db.exists())
+                result = self.list_name(fresh_db, "星河科技", name)
+                self.assert_list_rejected(result, "name: must not be empty")
+                # 拒绝后数据库文件及任何 SQLite 伴随文件都不应被创建
+                self.assertFalse(fresh_db.exists())
+                self.assertEqual(list(self.tmpdir.glob(fresh_db.name + "*")), [])
+
     # ---- update-email 子命令的回归测试 ----
 
     def update_email(self, db_path, contact_id, email):
