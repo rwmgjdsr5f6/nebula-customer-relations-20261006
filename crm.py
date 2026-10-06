@@ -140,6 +140,12 @@ def cmd_list(args):
     if not company:
         fail("company", "must not be empty")
 
+    name = None
+    if args.name is not None:
+        name = clean(args.name)
+        if not name:
+            fail("name", "must not be empty")
+
     conn = connect_db(args.db)
     try:
         rows = conn.execute(
@@ -153,6 +159,7 @@ def cmd_list(args):
     records = [
         {"id": row[0], "name": row[1], "email": row[2], "company": row[3]}
         for row in rows
+        if name is None or name in row[1]
     ]
     print(json.dumps(records, ensure_ascii=False))
     return 0
@@ -172,6 +179,7 @@ def build_parser():
 
     parser_list = subparsers.add_parser("list", help="按公司筛选联系人")
     parser_list.add_argument("--company", required=True, help="公司名")
+    parser_list.add_argument("--name", help="姓名子串（可选，字面值匹配）")
     parser_list.set_defaults(func=cmd_list)
 
     parser_update = subparsers.add_parser("update-email", help="按编号更新邮箱")
