@@ -6,6 +6,7 @@
 """
 
 import json
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -286,6 +287,193 @@ class CRMTestCase(unittest.TestCase):
 
         result = self.list_company(fresh_db, "   ")
         self.assert_list_rejected(result, "company: must not be empty")
+        self.assertFalse(missing_parent.exists())
+        self.assertFalse(fresh_db.exists())
+
+    # ---- update-email 子命令的行为回归测试 ----
+
+    def update_email(self, db_path, contact_id, email):
+        return self.run_crm(
+            db_path, "update-email", "--id", contact_id, "--email", email
+        )
+
+    def seed_fixed_update_contacts(self):
+        """按固定样例新增三名联系人，编号以新增结果为准，按新增顺序返回。"""
+        result_lin = self.add_contact(
+            self.db_path, "林宁", "lin@example.test", "星河科技"
+        )
+        lin = self.assert_add_success(
+            result_lin,
+            {"name": "林宁", "email": "lin@example.test", "company": "星河科技"},
+        )
+
+        result_xu = self.add_contact(
+            self.db_path, "许禾", "xu@example.test", "星河科技"
+        )
+        xu = self.assert_add_success(
+            result_xu,
+            {"name": "许禾", "email": "xu@example.test", "company": "星河科技"},
+        )
+
+        result_zhou = self.add_contact(
+            self.db_path, "周岚", "zhou@example.test", "远帆咨询"
+        )
+        zhou = self.assert_add_success(
+            result_zhou,
+            {"name": "周岚", "email": "zhou@example.test", "company": "远帆咨询"},
+        )
+
+        self.assertLess(lin["id"], xu["id"])
+        self.assertLess(xu["id"], zhou["id"])
+        return lin, xu, zhou
+
+    def assert_update_rejected(self, result, expected_stderr_line):
+        """断言 update-email 被拒绝：退出码 2、无标准输出、标准错误恰为一行。"""
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(
+            result.stderr.decode("utf-8"), expected_stderr_line + "\n"
+        )
+
+    def assert_all_records_unchanged(self, lin, xu, zhou):
+        """以独立命令逐字段核对三条记录内容与编号升序，并核对记录总数。"""
+        self.assert_list_success(self.db_path, "星河科技", [lin, xu])
+        self.assert_list_success(self.db_path, "远帆咨询", [zhou])
+
+        with sqlite3.connect(str(self.db_path)) as conn:
+            total = conn.execute("SELECT COUNT(*) FROM contacts").fetchone()[0]
+        self.assertEqual(total, 3)
+
+    def test_update_email_persists_and_is_visible_to_later_list(self):
+        lin, xu, zhou = self.seed_fixed_update_contacts()
+
+        # 编号带首尾空白和前导零，邮箱带首尾空白；使用同一 --db 路径
+        padded_id = "  000" + str(lin["id"]) + "  "
+        result = self.update_email(
+            self.db_path, padded_id, "  Lin.New@Example.test  "
+        )
+
+        # 成功：退出码 0、标准错误为空，标准输出整体为一个联系人 JSON 对象
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8"))
+        self.assertEqual(result.stderr, b"")
+        record = json.loads(result.stdout.decode("utf-8"))
+        self.assertIsInstance(record, dict)
+        self.assertEqual(set(record.keys()), {"id", "name", "email", "company"})
+
+        # 邮箱去除首尾空白并保留大小写；编号、姓名、公司不变
+        updated_lin = {
+            "id": lin["id"],
+            "name": "林宁",
+            "email": "Lin.New@Example.test",
+            "company": "星河科技",
+        }
+        self.assertEqual(record, updated_lin)
+
+        # 独立命令按公司查询读到新邮箱，列表按编号升序；其余联系人保持原记录
+        self.assert_list_success(self.db_path, "星河科技", [updated_lin, xu])
+        self.assert_list_success(self.db_path, "远帆咨询", [zhou])
+        with sqlite3.connect(str(self.db_path)) as conn:
+            total = conn.execute("SELECT COUNT(*) FROM contacts").fetchone()[0]
+        self.assertEqual(total, 3)
+
+        # 再次提交相同邮箱仍按成功处理，不增加记录
+        again = self.update_email(
+            self.db_path, padded_id, "  Lin.New@Example.test  "
+        )
+        self.assertEqual(again.returncode, 0, again.stderr.decode("utf-8"))
+        self.assertEqual(again.stderr, b"")
+        self.assertEqual(json.loads(again.stdout.decode("utf-8")), updated_lin)
+        self.assert_list_success(self.db_path, "星河科技", [updated_lin, xu])
+        self.assert_list_success(self.db_path, "远帆咨询", [zhou])
+        with sqlite3.connect(str(self.db_path)) as conn:
+            total = conn.execute("SELECT COUNT(*) FROM contacts").fetchone()[0]
+        self.assertEqual(total, 3)
+
+    def test_update_email_invalid_inputs_leave_existing_records_unchanged(self):
+        lin, xu, zhou = self.seed_fixed_update_contacts()
+
+        # 每个用例：(编号, 邮箱, 期望的标准错误行)
+        invalid_cases = [
+            # 编号问题
+            ("", "new@example.test", "id: must be a positive integer"),
+            ("   ", "new@example.test", "id: must be a positive integer"),
+            ("0", "new@example.test", "id: must be a positive integer"),
+            ("-1", "new@example.test", "id: must be a positive integer"),
+            ("1.5", "new@example.test", "id: must be a positive integer"),
+            (
+                "9223372036854775808",
+                "new@example.test",
+                "id: must be a positive integer",
+            ),
+            # 邮箱问题：缺少 @ 或含内部空白
+            (str(lin["id"]), "no-at-sign", "email: invalid email address"),
+            (
+                str(lin["id"]),
+                "bad new@example.test",
+                "email: invalid email address",
+            ),
+            # 两者同时无效时只报告编号错误
+            ("0", "no-at-sign", "id: must be a positive integer"),
+        ]
+
+        for contact_id, email, expected_stderr in invalid_cases:
+            with self.subTest(contact_id=contact_id, email=email):
+                result = self.update_email(self.db_path, contact_id, email)
+                self.assert_update_rejected(result, expected_stderr)
+                # 已有记录逐字段不变
+                self.assert_all_records_unchanged(lin, xu, zhou)
+
+    def test_update_email_invalid_inputs_do_not_create_missing_database(self):
+        invalid_cases = [
+            ("", "new@example.test"),
+            ("   ", "new@example.test"),
+            ("0", "new@example.test"),
+            ("-1", "new@example.test"),
+            ("1.5", "new@example.test"),
+            ("9223372036854775808", "new@example.test"),
+            ("1", "no-at-sign"),
+            ("1", "bad new@example.test"),
+            ("0", "no-at-sign"),
+        ]
+
+        for index, (contact_id, email) in enumerate(invalid_cases):
+            fresh_db = self.tmpdir / f"update-fresh-{index}.sqlite3"
+            with self.subTest(contact_id=contact_id, email=email):
+                # 父目录已存在，但数据库文件尚不存在
+                self.assertTrue(self.tmpdir.is_dir())
+                self.assertFalse(fresh_db.exists())
+                result = self.update_email(fresh_db, contact_id, email)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, b"")
+                self.assertEqual(len(result.stderr.decode("utf-8").splitlines()), 1)
+                # 数据库文件及任何 SQLite 伴随文件都不应被创建
+                self.assertFalse(fresh_db.exists())
+                self.assertEqual(list(self.tmpdir.glob(fresh_db.name + "*")), [])
+
+    def test_update_email_unknown_id_creates_empty_database_and_reports_not_found(self):
+        fresh_db = self.tmpdir / "update-unknown.sqlite3"
+        self.assertFalse(fresh_db.exists())
+
+        # 合法编号格式与合法邮箱，但联系人不存在：创建空数据库并返回未找到
+        result = self.update_email(fresh_db, "  999  ", "new@example.test")
+        self.assert_update_rejected(result, "id: contact not found")
+        self.assertTrue(fresh_db.exists())
+
+        # 随后查询得到空数组
+        self.assert_list_success(fresh_db, "星河科技", [])
+        self.assert_list_success(fresh_db, "远帆咨询", [])
+        with sqlite3.connect(str(fresh_db)) as conn:
+            total = conn.execute("SELECT COUNT(*) FROM contacts").fetchone()[0]
+        self.assertEqual(total, 0)
+
+    def test_update_email_missing_parent_directory_is_rejected_without_being_created(
+        self,
+    ):
+        missing_parent = self.tmpdir / "no-such-parent"
+        fresh_db = missing_parent / "contacts.sqlite3"
+
+        result = self.update_email(fresh_db, "1", "new@example.test")
+        self.assert_update_rejected(result, "db: parent directory does not exist")
         self.assertFalse(missing_parent.exists())
         self.assertFalse(fresh_db.exists())
 
