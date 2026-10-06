@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """本地客户关系管理台命令行入口。
 
-仅支持两个行为：
-- add:  新增联系人
-- list: 按公司名精确筛选联系人
+支持三个行为：
+- add:          新增联系人
+- list:         按公司名精确筛选联系人
+- update-email: 按编号更新联系人邮箱
 
 数据持久化在通过 --db 指定的 SQLite 数据库文件中，
 文件不存在时自动初始化，已存在则复用。
@@ -51,6 +52,20 @@ def valid_email(email):
     return True
 
 
+MAX_ID = 9223372036854775807
+
+
+def parse_id(raw):
+    """编号去除首尾空白后须为 1 至 2^63-1 的 ASCII 数字串。"""
+    value = clean(raw)
+    if not value.isascii() or not value.isdigit():
+        fail("id", "must be a positive integer")
+    number = int(value)
+    if not 1 <= number <= MAX_ID:
+        fail("id", "must be a positive integer")
+    return number
+
+
 def connect_db(db_path):
     """父目录存在时连接数据库，初始化缺失的表；复用已有数据库。"""
     if not Path(db_path).parent.is_dir():
@@ -93,6 +108,33 @@ def cmd_add(args):
     return 0
 
 
+def cmd_update_email(args):
+    contact_id = parse_id(args.id)
+    email = clean(args.email)
+    if not valid_email(email):
+        fail("email", "invalid email address")
+
+    conn = connect_db(args.db)
+    try:
+        cursor = conn.execute(
+            "UPDATE contacts SET email = ? WHERE id = ?",
+            (email, contact_id),
+        )
+        conn.commit()
+        if cursor.rowcount == 0:
+            fail("id", "contact not found")
+        row = conn.execute(
+            "SELECT id, name, email, company FROM contacts WHERE id = ?",
+            (contact_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    record = {"id": row[0], "name": row[1], "email": row[2], "company": row[3]}
+    print(json.dumps(record, ensure_ascii=False))
+    return 0
+
+
 def cmd_list(args):
     company = clean(args.company)
     if not company:
@@ -131,6 +173,13 @@ def build_parser():
     parser_list = subparsers.add_parser("list", help="按公司筛选联系人")
     parser_list.add_argument("--company", required=True, help="公司名")
     parser_list.set_defaults(func=cmd_list)
+
+    parser_update_email = subparsers.add_parser(
+        "update-email", help="按编号更新联系人邮箱"
+    )
+    parser_update_email.add_argument("--id", required=True, help="联系人编号")
+    parser_update_email.add_argument("--email", required=True, help="新邮箱")
+    parser_update_email.set_defaults(func=cmd_update_email)
 
     return parser
 
