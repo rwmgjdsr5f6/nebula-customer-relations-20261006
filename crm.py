@@ -27,6 +27,9 @@ CREATE TABLE IF NOT EXISTS contacts (
 """
 
 
+MAX_CONTACT_ID = 9223372036854775807
+
+
 def fail(field, message):
     """输出字段错误到标准错误并以退出码 2 结束。"""
     print(f"{field}: {message}", file=sys.stderr)
@@ -36,6 +39,18 @@ def fail(field, message):
 def clean(value):
     """清理首尾空白，保留内部字符与大小写。"""
     return value.strip()
+
+
+def parse_contact_id(raw_value):
+    """清理编号首尾空白并校验为正整数（允许前导零），返回整数编号。"""
+    raw_id = clean(raw_value)
+    if (
+        not raw_id
+        or not all("0" <= ch <= "9" for ch in raw_id)
+        or not 1 <= int(raw_id) <= MAX_CONTACT_ID
+    ):
+        fail("id", "must be a positive integer")
+    return int(raw_id)
 
 
 def valid_email(email):
@@ -95,20 +110,17 @@ def cmd_add(args):
     return 0
 
 
-def cmd_update_email(args):
-    raw_id = clean(args.id)
-    email = clean(args.email)
+def update_contact_field(args, field, raw_value, is_valid, invalid_message, update_sql):
+    """按编号更新单个字段的共用流程。
 
-    if (
-        not raw_id
-        or not all("0" <= ch <= "9" for ch in raw_id)
-        or not 1 <= int(raw_id) <= 9223372036854775807
-    ):
-        fail("id", "must be a positive integer")
-    contact_id = int(raw_id)
-
-    if not valid_email(email):
-        fail("email", "invalid email address")
+    编号与新值的清理、校验顺序以及数据库访问规则对两个更新入口一致：
+    先校验编号，再校验新值，随后连接数据库并核对联系人存在，
+    最终只更新目标字段，输出更新后的完整联系人 JSON 对象。
+    """
+    contact_id = parse_contact_id(args.id)
+    new_value = clean(raw_value)
+    if not is_valid(new_value):
+        fail(field, invalid_message)
 
     conn = connect_db(args.db)
     try:
@@ -118,51 +130,7 @@ def cmd_update_email(args):
         ).fetchone()
         if row is None:
             fail("id", "contact not found")
-        conn.execute(
-            "UPDATE contacts SET email = ? WHERE id = ?",
-            (email, contact_id),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-    record = {
-        "id": row[0],
-        "name": row[1],
-        "email": email,
-        "company": row[3],
-    }
-    print(json.dumps(record, ensure_ascii=False))
-    return 0
-
-
-def cmd_update_company(args):
-    raw_id = clean(args.id)
-    company = clean(args.company)
-
-    if (
-        not raw_id
-        or not all("0" <= ch <= "9" for ch in raw_id)
-        or not 1 <= int(raw_id) <= 9223372036854775807
-    ):
-        fail("id", "must be a positive integer")
-    contact_id = int(raw_id)
-
-    if not company:
-        fail("company", "must not be empty")
-
-    conn = connect_db(args.db)
-    try:
-        row = conn.execute(
-            "SELECT id, name, email, company FROM contacts WHERE id = ?",
-            (contact_id,),
-        ).fetchone()
-        if row is None:
-            fail("id", "contact not found")
-        conn.execute(
-            "UPDATE contacts SET company = ? WHERE id = ?",
-            (company, contact_id),
-        )
+        conn.execute(update_sql, (new_value, contact_id))
         conn.commit()
     finally:
         conn.close()
@@ -171,10 +139,33 @@ def cmd_update_company(args):
         "id": row[0],
         "name": row[1],
         "email": row[2],
-        "company": company,
+        "company": row[3],
     }
+    record[field] = new_value
     print(json.dumps(record, ensure_ascii=False))
     return 0
+
+
+def cmd_update_email(args):
+    return update_contact_field(
+        args,
+        "email",
+        args.email,
+        valid_email,
+        "invalid email address",
+        "UPDATE contacts SET email = ? WHERE id = ?",
+    )
+
+
+def cmd_update_company(args):
+    return update_contact_field(
+        args,
+        "company",
+        args.company,
+        bool,
+        "must not be empty",
+        "UPDATE contacts SET company = ? WHERE id = ?",
+    )
 
 
 def cmd_list(args):
