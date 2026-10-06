@@ -140,13 +140,27 @@ def cmd_list(args):
     if not company:
         fail("company", "must not be empty")
 
+    name = None
+    if args.name is not None:
+        name = clean(args.name)
+        if not name:
+            fail("name", "must not be empty")
+
     conn = connect_db(args.db)
     try:
-        rows = conn.execute(
-            "SELECT id, name, email, company "
-            "FROM contacts WHERE company = ? ORDER BY id ASC",
-            (company,),
-        ).fetchall()
+        if name is None:
+            rows = conn.execute(
+                "SELECT id, name, email, company "
+                "FROM contacts WHERE company = ? ORDER BY id ASC",
+                (company,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, name, email, company "
+                "FROM contacts WHERE company = ? AND instr(name, ?) > 0 "
+                "ORDER BY id ASC",
+                (company, name),
+            ).fetchall()
     finally:
         conn.close()
 
@@ -172,6 +186,7 @@ def build_parser():
 
     parser_list = subparsers.add_parser("list", help="按公司筛选联系人")
     parser_list.add_argument("--company", required=True, help="公司名")
+    parser_list.add_argument("--name", help="姓名子串（字面子串匹配，区分大小写）")
     parser_list.set_defaults(func=cmd_list)
 
     parser_update = subparsers.add_parser("update-email", help="按编号更新邮箱")
