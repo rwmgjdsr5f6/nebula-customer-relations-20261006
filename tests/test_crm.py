@@ -52,6 +52,9 @@ INVALID_ADD_CASES = [
     ),
 ]
 
+# 空字符串或仅由空格、制表符组成的公司参数
+BLANK_COMPANY_VALUES = ["", "   ", "\t\t", " \t "]
+
 
 class CRMTestCase(unittest.TestCase):
     def setUp(self):
@@ -93,6 +96,7 @@ class CRMTestCase(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8"))
         self.assertEqual(result.stderr, b"")
         records = json.loads(result.stdout.decode("utf-8"))
+        self.assertIsInstance(records, list)
         self.assertEqual(records, expected_records)
         return records
 
@@ -136,6 +140,84 @@ class CRMTestCase(unittest.TestCase):
         self.assert_list_success(self.db_path, "星河科技", [lin, xu])
         # 远帆咨询只能查到周岚
         self.assert_list_success(self.db_path, "远帆咨询", [zhou])
+
+    def test_list_strips_surrounding_whitespace_in_company(self):
+        lin, xu, zhou = self.seed_sample_contacts()
+
+        # 公司参数首尾带空格或制表符时，结果与去除空白后的查询相同
+        for padded in ["  星河科技  ", "\t星河科技\t", " \t 星河科技 \t "]:
+            with self.subTest(company=padded):
+                self.assert_list_success(self.db_path, padded, [lin, xu])
+        self.assert_list_success(self.db_path, " \t远帆咨询\t ", [zhou])
+
+    def test_list_requires_exact_company_match(self):
+        self.seed_sample_contacts()
+
+        # 子串、内部空白不同的写法、未录入的公司都返回空数组
+        for company in ["星河", "星河 科技", "未录入公司"]:
+            with self.subTest(company=company):
+                records = self.assert_list_success(self.db_path, company, [])
+                self.assertEqual(records, [])
+
+    def test_list_on_missing_database_creates_file_and_returns_empty(self):
+        # 父目录存在而数据库文件尚不存在时，有效 list 创建该文件并返回空数组
+        self.assertFalse(self.db_path.exists())
+        records = self.assert_list_success(self.db_path, "星河科技", [])
+        self.assertEqual(records, [])
+        self.assertTrue(self.db_path.exists())
+
+        # 再次通过独立命令查询仍返回空数组，不产生联系人
+        again = self.assert_list_success(self.db_path, "星河科技", [])
+        self.assertEqual(again, [])
+        self.assert_list_success(self.db_path, "远帆咨询", [])
+
+    def test_list_rejects_blank_company(self):
+        for company in BLANK_COMPANY_VALUES:
+            with self.subTest(company=company):
+                result = self.list_company(self.db_path, company)
+                self.assert_rejected(result, "company: must not be empty")
+
+    def test_list_blank_company_does_not_create_missing_database(self):
+        for index, company in enumerate(BLANK_COMPANY_VALUES):
+            fresh_db = self.tmpdir / f"list-fresh-{index}.sqlite3"
+            with self.subTest(company=company):
+                self.assertFalse(fresh_db.exists())
+                result = self.list_company(fresh_db, company)
+                self.assert_rejected(result, "company: must not be empty")
+                # 数据库文件及任何 SQLite 伴随文件都不应被创建
+                self.assertFalse(fresh_db.exists())
+                self.assertEqual(list(self.tmpdir.glob(fresh_db.name + "*")), [])
+
+    def test_list_blank_company_leaves_existing_records_unchanged(self):
+        lin, xu, zhou = self.seed_sample_contacts()
+
+        for company in BLANK_COMPANY_VALUES:
+            with self.subTest(company=company):
+                result = self.list_company(self.db_path, company)
+                self.assert_rejected(result, "company: must not be empty")
+
+                # 拒绝后两家公司的记录内容和数量保持不变
+                self.assert_list_success(self.db_path, "星河科技", [lin, xu])
+                self.assert_list_success(self.db_path, "远帆咨询", [zhou])
+
+    def test_list_missing_parent_directory_is_rejected_without_being_created(self):
+        missing_parent = self.tmpdir / "no-such-parent"
+        fresh_db = missing_parent / "contacts.sqlite3"
+
+        result = self.list_company(fresh_db, "星河科技")
+        self.assert_rejected(result, "db: parent directory does not exist")
+        self.assertFalse(missing_parent.exists())
+        self.assertFalse(fresh_db.exists())
+
+    def test_list_blank_company_with_missing_parent_reports_company_error(self):
+        missing_parent = self.tmpdir / "no-such-parent"
+        fresh_db = missing_parent / "contacts.sqlite3"
+
+        # 无效公司和缺失父目录同时出现时，只报告公司错误
+        result = self.list_company(fresh_db, "  \t ")
+        self.assert_rejected(result, "company: must not be empty")
+        self.assertFalse(missing_parent.exists())
+        self.assertFalse(fresh_db.exists())
 
     def assert_rejected(self, result, expected_stderr):
         """断言命令被拒绝：退出码 2、无标准输出、标准错误精确匹配。"""
