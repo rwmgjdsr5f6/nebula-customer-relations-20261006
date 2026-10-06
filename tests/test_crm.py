@@ -52,6 +52,26 @@ INVALID_ADD_CASES = [
     ),
 ]
 
+# (update-email 子命令的 --id 与 --email 参数, 期望的标准错误)
+INVALID_UPDATE_EMAIL_CASES = [
+    # 编号为空白
+    (("   ", "ok@example.test"), "id: must be a positive integer"),
+    # 编号为 0
+    (("0", "ok@example.test"), "id: must be a positive integer"),
+    # 编号为负数
+    (("-1", "ok@example.test"), "id: must be a positive integer"),
+    # 编号为小数
+    (("1.5", "ok@example.test"), "id: must be a positive integer"),
+    # 编号超出 64 位有符号整数上限
+    (("9223372036854775808", "ok@example.test"), "id: must be a positive integer"),
+    # 邮箱缺少 @
+    (("1", "noatsign.example.test"), "email: invalid email address"),
+    # 邮箱含内部空白
+    (("1", "a b@example.test"), "email: invalid email address"),
+    # 编号与邮箱同时无效时只报告编号错误
+    (("1.5", "noatsign.example.test"), "id: must be a positive integer"),
+]
+
 
 class CRMTestCase(unittest.TestCase):
     def setUp(self):
@@ -288,6 +308,144 @@ class CRMTestCase(unittest.TestCase):
         self.assert_list_rejected(result, "company: must not be empty")
         self.assertFalse(missing_parent.exists())
         self.assertFalse(fresh_db.exists())
+
+    # ---- update-email 子命令的回归测试 ----
+
+    def update_email(self, db_path, contact_id, email):
+        return self.run_crm(
+            db_path, "update-email", "--id", str(contact_id), "--email", email
+        )
+
+    def seed_update_email_contacts(self):
+        """新增 update-email 固定样例：林宁/许禾（星河科技）、周岚（远帆咨询）。"""
+        lin = self.assert_add_success(
+            self.add_contact(self.db_path, "林宁", "lin@example.test", "星河科技"),
+            {"name": "林宁", "email": "lin@example.test", "company": "星河科技"},
+        )
+        xu = self.assert_add_success(
+            self.add_contact(self.db_path, "许禾", "xu@example.test", "星河科技"),
+            {"name": "许禾", "email": "xu@example.test", "company": "星河科技"},
+        )
+        zhou = self.assert_add_success(
+            self.add_contact(self.db_path, "周岚", "zhou@example.test", "远帆咨询"),
+            {"name": "周岚", "email": "zhou@example.test", "company": "远帆咨询"},
+        )
+        self.assertLess(lin["id"], xu["id"])
+        self.assertLess(xu["id"], zhou["id"])
+        return lin, xu, zhou
+
+    def assert_update_success(self, result, expected):
+        """断言更新成功并返回解析后的联系人字典。"""
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8"))
+        self.assertEqual(result.stderr, b"")
+        # 标准输出整体可解析为单个联系人 JSON 对象，只含原有四个字段
+        record = json.loads(result.stdout.decode("utf-8"))
+        self.assertEqual(set(record.keys()), {"id", "name", "email", "company"})
+        self.assertEqual(record, expected)
+        return record
+
+    def assert_update_rejected(self, result, expected_stderr_line):
+        """断言 update-email 被拒绝：退出码 2、无标准输出、标准错误恰为单行。"""
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(
+            result.stderr.decode("utf-8"), expected_stderr_line + "\n"
+        )
+
+    def test_update_email_success_persists_and_preserves_other_records(self):
+        lin, xu, zhou = self.seed_update_email_contacts()
+
+        # 编号与邮箱输入均带首尾空白，编号还带前导零
+        result = self.update_email(
+            self.db_path, f"  00{lin['id']}  ", "  Lin.New@Example.test  "
+        )
+        updated_lin = self.assert_update_success(
+            result,
+            {
+                "id": lin["id"],
+                "name": "林宁",
+                "email": "Lin.New@Example.test",
+                "company": "星河科技",
+            },
+        )
+        # 邮箱去除首尾空白并保留大小写，编号、姓名和公司不变
+        self.assertEqual(updated_lin["email"], "Lin.New@Example.test")
+        self.assertEqual(updated_lin["id"], lin["id"])
+        self.assertEqual(updated_lin["name"], lin["name"])
+        self.assertEqual(updated_lin["company"], lin["company"])
+
+        # 独立命令按公司查询读到新邮箱，列表保持编号升序，其他记录不变
+        records = self.assert_list_success(self.db_path, "星河科技", [updated_lin, xu])
+        self.assertEqual([r["id"] for r in records], sorted(r["id"] for r in records))
+        self.assert_list_success(self.db_path, "远帆咨询", [zhou])
+        # 记录总数不变
+        self.assertEqual(len(records), 2)
+
+    def test_update_email_same_value_again_still_succeeds_without_new_records(self):
+        lin, xu, zhou = self.seed_update_email_contacts()
+
+        first = self.update_email(self.db_path, lin["id"], "Lin.New@Example.test")
+        updated_lin = self.assert_update_success(
+            first, {**lin, "email": "Lin.New@Example.test"}
+        )
+
+        # 再次提交相同邮箱仍按成功处理
+        second = self.update_email(self.db_path, lin["id"], "Lin.New@Example.test")
+        self.assert_update_success(second, updated_lin)
+
+        # 不增加记录，所有记录内容保持不变
+        self.assert_list_success(self.db_path, "星河科技", [updated_lin, xu])
+        self.assert_list_success(self.db_path, "远帆咨询", [zhou])
+
+    def test_update_email_invalid_inputs_leave_records_unchanged(self):
+        lin, xu, zhou = self.seed_update_email_contacts()
+
+        for (contact_id, email), expected_stderr in INVALID_UPDATE_EMAIL_CASES:
+            with self.subTest(contact_id=contact_id, email=email):
+                result = self.update_email(self.db_path, contact_id, email)
+                self.assert_update_rejected(result, expected_stderr)
+
+                # 拒绝后两家公司的记录逐字段不变
+                self.assert_list_success(self.db_path, "星河科技", [lin, xu])
+                self.assert_list_success(self.db_path, "远帆咨询", [zhou])
+
+    def test_update_email_unknown_id_reports_not_found_and_keeps_records(self):
+        lin, xu, zhou = self.seed_update_email_contacts()
+
+        for unknown_id in (zhou["id"] + 1000, 9223372036854775807):
+            with self.subTest(contact_id=unknown_id):
+                result = self.update_email(
+                    self.db_path, unknown_id, "ok@example.test"
+                )
+                self.assert_update_rejected(result, "id: contact not found")
+
+                self.assert_list_success(self.db_path, "星河科技", [lin, xu])
+                self.assert_list_success(self.db_path, "远帆咨询", [zhou])
+
+    def test_update_email_invalid_input_does_not_create_missing_database(self):
+        for index, ((contact_id, email), expected_stderr) in enumerate(
+            INVALID_UPDATE_EMAIL_CASES
+        ):
+            fresh_db = self.tmpdir / f"update-fresh-{index}.sqlite3"
+            with self.subTest(contact_id=contact_id, email=email):
+                self.assertFalse(fresh_db.exists())
+                result = self.update_email(fresh_db, contact_id, email)
+                self.assert_update_rejected(result, expected_stderr)
+                # 数据库文件及任何 SQLite 伴随文件都不应被创建
+                self.assertFalse(fresh_db.exists())
+                self.assertEqual(list(self.tmpdir.glob(fresh_db.name + "*")), [])
+
+    def test_update_email_unknown_id_creates_empty_database(self):
+        fresh_db = self.tmpdir / "update-unknown.sqlite3"
+        self.assertFalse(fresh_db.exists())
+
+        # 合法输入但编号不存在：创建空数据库并返回未找到
+        result = self.update_email(fresh_db, "1", "ok@example.test")
+        self.assert_update_rejected(result, "id: contact not found")
+        self.assertTrue(fresh_db.exists())
+
+        # 随后查询得到空数组
+        self.assert_list_success(fresh_db, "星河科技", [])
 
 
 if __name__ == "__main__":
