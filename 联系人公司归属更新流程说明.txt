@@ -1,0 +1,309 @@
+联系人公司归属更新流程说明（update-company）
+=============================================
+
+本说明只解释 crm.py 中 update-company 子命令的既有行为，不提出任何
+新增功能或修改建议，也不改动 crm.py、现有测试、README 或数据库结构；
+add、list、update-email 的公开行为不在本文范围内，保持不变。
+
+文中所有结论均依据实际读取的仓库文件，引用格式为"相对路径:行号"：
+
+  - crm.py（命令行入口与全部业务逻辑，共 248 行）
+  - tests/test_update_company.py（update-company 的子进程回归测试，
+    共 239 行）
+
+为便于手工核对，第五节给出一份完整样例。样例中的输出是依据源码
+推导的预期结果，用于说明"应当看到什么"，不作为实测记录引用；
+读者可按同样步骤自行执行验证。
+
+
+一、命令输入：参数如何进入程序
+------------------------------
+
+update-company 的调用形式为：
+
+    python crm.py --db <数据库文件> update-company --id <联系人编号> --company <新公司名>
+
+参数定义在 build_parser()（crm.py:208-237）：
+
+  - --db 是顶层解析器的必填参数（crm.py:210，required=True），
+    必须写在子命令之前；没有默认存储位置。
+  - update-company 子命令注册于 crm.py:230-232，处理函数为
+    cmd_update_company（crm.py:235 的 set_defaults）。
+  - --id 与 --company 均为 required=True（crm.py:233-234），
+    除"必填"外没有任何缺省值或可选参数；漏传由 argparse 拒绝，
+    退出码 2，用法文本由 argparse 生成。
+
+cmd_update_company（crm.py:160-168）本身不直接实现逻辑，而是调用
+两个更新入口共用的 update_contact_field()（crm.py:113-146），并传入：
+
+  - 字段名 "company"；
+  - 原始输入 args.company；
+  - 校验函数 bool（即清理后非空即合法）；
+  - 错误消息 "must not be empty"；
+  - 更新语句 "UPDATE contacts SET company = ? WHERE id = ?"。
+
+因此 update-company 与 update-email 走完全相同的清理、校验、
+数据库访问顺序，差别只在目标字段、校验规则与 SQL（crm.py:113-118
+的 docstring 亦如此说明）。
+
+
+二、提交修改：从参数到落盘的完整路径
+------------------------------------
+
+update_contact_field()（crm.py:113-146）严格按以下顺序执行：
+
+1. 校验编号（crm.py:120 调用 parse_contact_id，crm.py:44-53）
+   先经 clean()（crm.py:39-41，即 value.strip()）去掉首尾空白，
+   再要求：非空、每个字符都是数字 0-9、整数值落在
+   1 到 9223372036854775807（MAX_CONTACT_ID，crm.py:30）之间。
+   前导零是允许的：" 001 " 清理并转换后就是整数 1。
+   任一条件不满足即 fail("id", "must be a positive integer")。
+
+2. 校验新公司名（crm.py:121-123）
+   同样先 clean() 去首尾空白，再用 bool 判断非空；清理后为空即
+   fail("company", "must not be empty")。除"非空"外没有其他
+   公司名规则（不校验是否已存在、不做归一化）。
+   注意顺序：编号校验在前，公司校验在后，两者同时无效时只报告
+   编号错误（tests/test_update_company.py:32-34 的用例固定了
+   这一短路顺序）。
+
+   以上两步全部发生在打开数据库之前（connect_db 在 crm.py:125
+   才被调用），因此输入校验失败时进程根本不接触数据库文件。
+
+3. 连接数据库（crm.py:125 调用 connect_db，crm.py:71-78）
+   - 先用 Path(db_path).parent.is_dir() 检查父目录；父目录不存在
+     时 fail("db", "parent directory does not exist")，程序不会
+     代为创建目录或文件。
+   - 父目录存在时 sqlite3.connect(db_path)：数据库文件不存在则
+     新建，已存在则原样复用；随后执行 CREATE TABLE IF NOT EXISTS
+     contacts（CREATE_TABLE_SQL，crm.py:20-27）并 commit。
+   - 这意味着：输入合法但数据库文件原本不存在（父目录存在）时，
+     会先创建一个空数据库，再进入下一步。
+
+4. 核对联系人存在（crm.py:127-132）
+   执行 SELECT id, name, email, company FROM contacts WHERE id = ?，
+   查不到行即 fail("id", "contact not found")。注意这一步在
+   连接数据库之后，所以"编号不存在"的报错晚于数据库的创建。
+
+5. 更新并提交（crm.py:133-136）
+   执行 UPDATE contacts SET company = ? WHERE id = ?，绑定的是
+   clean 之后的新公司名与整数编号；随后 conn.commit()，并在
+   finally 中 conn.close()。即：修改在进程结束前已经提交落盘。
+   该 UPDATE 只触及 company 一列、只影响编号匹配的一行：
+   不会创建任何"公司"档案（仓库中不存在公司表），也不会把原公司
+   下的其他联系人一并迁移。
+
+6. 输出（crm.py:138-145）
+   用第 4 步读到的行组装含 id/name/email/company 四个键的对象，
+   再把 company 键覆盖为新值（record[field] = new_value，
+   crm.py:144），json.dumps(..., ensure_ascii=False) 输出单行
+   JSON 到标准输出，中文不转义，返回退出码 0。因此编号、姓名、
+   邮箱保持数据库中的原值，公司列是清理后的新值。
+
+错误输出统一由 fail()（crm.py:33-36）产生：把"<字段>: <消息>"
+一行写入标准错误，标准输出保持为空，然后 sys.exit(2)。所有
+业务失败都是退出码 2、标准输出为空、标准错误恰好一行，不产生
+Python 异常堆栈。
+
+
+三、company 字段的真实含义
+--------------------------
+
+依据表结构（crm.py:20-27）与更新代码：
+
+  - company 是 contacts 表内的一个 TEXT NOT NULL 列，是联系人
+    记录行内的一个自由文本字段；仓库中不存在独立的"公司"表或
+    公司主数据，也没有外键关系。
+  - update-company 把某公司名写入目标联系人的这一列，仅此而已：
+      * 不会为"远帆咨询"这样的值创建公司档案或登记记录；
+      * 不会迁移、联动修改同公司的其他联系人——把林宁改到
+        远帆咨询后，星河科技下的许禾原样保留；
+      * 目标公司名是否已有其他联系人在用，不影响更新成败；
+      * 再次提交相同的公司名仍按成功处理（UPDATE 照常执行并
+        提交），不新增记录，联系人总数不变。
+  - list 子命令对该文本做精确相等匹配（crm.py:185-189），所以
+    更新后立即按新公司名查询即可命中该联系人。
+
+
+四、持久化：为何重新查询能读到已提交结果
+----------------------------------------
+
+每条命令都是独立的 Python 进程。update-company 在关闭连接前
+commit（crm.py:134-136），修改随事务提交写入 --db 指向的同一个
+SQLite 文件；随后另起的 list 进程用同一 --db 路径重新 connect
+（crm.py:182），执行 SELECT ... WHERE company = ? ORDER BY id ASC
+（crm.py:185-189），读到的就是已提交的数据。跨进程可见的依据
+就是"提交到同一文件 + 后续进程重新打开该文件"，中间没有任何
+内存缓存或延迟写。tests/test_update_company.py:122-157
+（test_update_company_success_persists_and_moves_contact）正是
+以独立子进程先更新、再分别查询两家公司来固定这一行为。
+
+
+五、可手工核对的完整样例（预期结果）
+------------------------------------
+
+前提：工作目录为 crm.py 所在目录，使用当前目录下一个全新的
+contacts.sqlite3（父目录即当前目录，事先存在；数据库文件在首次
+执行前不存在）。以下输出为依据源码推导的预期结果，非实测记录。
+
+1) 准备数据：依次新增三条联系人（add 的行为见既有说明，此处仅
+   作为准备步骤）
+
+     python crm.py --db contacts.sqlite3 add --name 林宁 --email lin@example.test --company 星河科技
+     python crm.py --db contacts.sqlite3 add --name 许禾 --email xu@example.test --company 星河科技
+     python crm.py --db contacts.sqlite3 add --name 周岚 --email zhou@example.test --company 远帆咨询
+
+   在"全新数据库、按此顺序插入"的前提下，三人依次得到编号
+   1、2、3（id 由 SQLite 的 AUTOINCREMENT 分配，crm.py:22；
+   换用已有数据库时以当次 add 输出的 id 为准）。
+
+2) 把林宁（编号 1）改到远帆咨询，编号与公司输入均带首尾空白，
+   编号还带前导零：
+
+     python crm.py --db contacts.sqlite3 update-company --id " 001 " --company " 远帆咨询 "
+
+   预期标准输出（退出码 0，标准错误为空）：
+
+     {"id": 1, "name": "林宁", "email": "lin@example.test", "company": "远帆咨询"}
+
+   即：编号、姓名、邮箱保持原值，公司去除首尾空白后为"远帆咨询"。
+   对应测试：tests/test_update_company.py:122-157，其
+   test_update_company_success_persists_and_moves_contact 用
+   f"  00{lin['id']}  " 与 "  远帆咨询  " 覆盖了同一情形
+   （tests/test_update_company.py:125-142）。
+
+3) 另起命令分别查询两家公司：
+
+     python crm.py --db contacts.sqlite3 list --company 星河科技
+
+   预期标准输出（星河科技只剩许禾）：
+
+     [{"id": 2, "name": "许禾", "email": "xu@example.test", "company": "星河科技"}]
+
+     python crm.py --db contacts.sqlite3 list --company 远帆咨询
+
+   预期标准输出（按编号升序为林宁、周岚）：
+
+     [{"id": 1, "name": "林宁", "email": "lin@example.test", "company": "远帆咨询"}, {"id": 3, "name": "周岚", "email": "zhou@example.test", "company": "远帆咨询"}]
+
+   重新查询能读到更新结果的原因见第四节。对应测试：
+   tests/test_update_company.py:144-157。
+
+4) 再次提交相同的公司名：
+
+     python crm.py --db contacts.sqlite3 update-company --id 1 --company 远帆咨询
+
+   预期仍返回成功，输出与第 2 步相同的 JSON；随后查询两家公司，
+   星河科技 1 条、远帆咨询 2 条，总记录数保持三条，所有记录
+   内容不变。对应测试：tests/test_update_company.py:159-176
+   （test_update_company_same_value_again_still_succeeds_without_new_records）。
+
+
+六、失败分支（预期结果）
+------------------------
+
+以下失败均满足：退出码 2、标准输出为空、标准错误恰好一行。
+除特别说明外，样例基于第五节已写入三条记录的 contacts.sqlite3。
+
+1) 编号为 0 或 1.5（非正整数）
+
+     python crm.py --db contacts.sqlite3 update-company --id 0 --company 远帆咨询
+     python crm.py --db contacts.sqlite3 update-company --id 1.5 --company 远帆咨询
+
+   预期标准错误均为：
+
+     id: must be a positive integer
+
+   依据 parse_contact_id（crm.py:44-53）：0 不在 1 到上限之间，
+   "1.5" 含非数字字符。对应测试用例：
+   tests/test_update_company.py:23-25。
+
+2) 合法编号配空白公司
+
+     python crm.py --db contacts.sqlite3 update-company --id 1 --company "   "
+
+   预期标准错误：
+
+     company: must not be empty
+
+   依据 crm.py:121-123（clean 后 bool 为假）。对应测试用例：
+   tests/test_update_company.py:29-31。
+
+3) 编号与公司同时无效
+
+     python crm.py --db contacts.sqlite3 update-company --id 0 --company "   "
+
+   预期只报告编号错误：
+
+     id: must be a positive integer
+
+   因为编号校验（crm.py:120）先于公司校验（crm.py:121-123）。
+   对应测试用例：tests/test_update_company.py:32-34。
+
+4) 输入合法但编号不存在
+
+     python crm.py --db contacts.sqlite3 update-company --id 999 --company 远帆咨询
+
+   预期标准错误：
+
+     id: contact not found
+
+   依据 crm.py:127-132 的存在性核对。对应测试：
+   tests/test_update_company.py:203-212
+   （test_update_company_unknown_id_reports_not_found_and_keeps_records，
+   该用例还断言三家公司的原有记录逐字段不变）。
+
+5) 输入合法但 --db 的父目录不存在
+
+     python crm.py --db no-such-dir/contacts.sqlite3 update-company --id 1 --company 远帆咨询
+
+   预期标准错误：
+
+     db: parent directory does not exist
+
+   依据 connect_db 的父目录检查（crm.py:73-74）；程序不会自动
+   创建缺失的目录或文件。对应测试：
+   tests/test_update_company.py:226-234
+   （test_update_company_missing_parent_directory_is_rejected，
+   断言目录与文件均未被创建）。
+
+
+七、失败前后的数据变化：两类情形要区分
+--------------------------------------
+
+1) 输入校验失败（编号或公司不合法）：校验在 connect_db 之前
+   （crm.py:120-123 对比 crm.py:125），进程根本不打开数据库——
+   指向已有库时库内记录逐字段不变；指向尚不存在的新文件时，
+   该文件（及任何 SQLite 伴随文件）不会被创建。对应测试：
+   tests/test_update_company.py:178-188
+   （test_update_company_invalid_inputs_leave_records_unchanged）
+   与 tests/test_update_company.py:190-201
+   （test_update_company_invalid_input_does_not_create_missing_database）。
+
+2) 输入合法、数据库原本不存在但父目录存在：connect_db 会先创建
+   空数据库并建表（crm.py:75-77），随后才因编号不存在而报告
+   id: contact not found。即失败也会留下一个空库文件；随后对该
+   文件执行 list 得到空数组：
+
+     python crm.py --db contacts.sqlite3 list --company 远帆咨询
+
+   预期标准输出：
+
+     []
+
+   对应测试：tests/test_update_company.py:214-224
+   （test_update_company_unknown_id_creates_empty_database）。
+
+   对照：父目录缺失时（第六节第 5 条）连空库都不会创建，
+   程序也不会代为建目录（tests/test_update_company.py:226-234）。
+
+
+八、本文不覆盖的事项
+--------------------
+
+  - add、list、update-email 的行为细节（另有既有说明，本文不重复，
+    其行为不因本文而有任何改变）；
+  - 多进程并发更新同一数据库时的锁等待与报错表现；
+  - 数据库文件损坏或被其他程序改写后的行为；
+  - argparse 自动生成的用法文本（随运行环境而定；业务错误文案
+    是 crm.py 中的固定英文串，可由源码确认）。
