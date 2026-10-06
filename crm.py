@@ -95,22 +95,21 @@ def cmd_add(args):
     return 0
 
 
-def cmd_update_email(args):
-    raw_id = clean(args.id)
-    email = clean(args.email)
-
+def parse_contact_id(raw):
+    """清理并校验编号：纯 ASCII 数字且在 64 位有符号正整数范围内。"""
+    raw_id = clean(raw)
     if (
         not raw_id
         or not all("0" <= ch <= "9" for ch in raw_id)
         or not 1 <= int(raw_id) <= 9223372036854775807
     ):
         fail("id", "must be a positive integer")
-    contact_id = int(raw_id)
+    return int(raw_id)
 
-    if not valid_email(email):
-        fail("email", "invalid email address")
 
-    conn = connect_db(args.db)
+def update_contact(db_path, contact_id, field, value):
+    """更新指定编号联系人的单个字段，返回更新后的完整记录。"""
+    conn = connect_db(db_path)
     try:
         row = conn.execute(
             "SELECT id, name, email, company FROM contacts WHERE id = ?",
@@ -119,60 +118,38 @@ def cmd_update_email(args):
         if row is None:
             fail("id", "contact not found")
         conn.execute(
-            "UPDATE contacts SET email = ? WHERE id = ?",
-            (email, contact_id),
+            f"UPDATE contacts SET {field} = ? WHERE id = ?",
+            (value, contact_id),
         )
         conn.commit()
     finally:
         conn.close()
 
-    record = {
-        "id": row[0],
-        "name": row[1],
-        "email": email,
-        "company": row[3],
-    }
+    record = {"id": row[0], "name": row[1], "email": row[2], "company": row[3]}
+    record[field] = value
+    return record
+
+
+def cmd_update_email(args):
+    contact_id = parse_contact_id(args.id)
+    email = clean(args.email)
+
+    if not valid_email(email):
+        fail("email", "invalid email address")
+
+    record = update_contact(args.db, contact_id, "email", email)
     print(json.dumps(record, ensure_ascii=False))
     return 0
 
 
 def cmd_update_company(args):
-    raw_id = clean(args.id)
+    contact_id = parse_contact_id(args.id)
     company = clean(args.company)
-
-    if (
-        not raw_id
-        or not all("0" <= ch <= "9" for ch in raw_id)
-        or not 1 <= int(raw_id) <= 9223372036854775807
-    ):
-        fail("id", "must be a positive integer")
-    contact_id = int(raw_id)
 
     if not company:
         fail("company", "must not be empty")
 
-    conn = connect_db(args.db)
-    try:
-        row = conn.execute(
-            "SELECT id, name, email, company FROM contacts WHERE id = ?",
-            (contact_id,),
-        ).fetchone()
-        if row is None:
-            fail("id", "contact not found")
-        conn.execute(
-            "UPDATE contacts SET company = ? WHERE id = ?",
-            (company, contact_id),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-    record = {
-        "id": row[0],
-        "name": row[1],
-        "email": row[2],
-        "company": company,
-    }
+    record = update_contact(args.db, contact_id, "company", company)
     print(json.dumps(record, ensure_ascii=False))
     return 0
 
