@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """本地客户关系管理台命令行入口。
 
-仅支持四个行为：
+仅支持五个行为：
 - add:            新增联系人
 - list:           按公司名精确筛选联系人
 - update-email:   按编号更新联系人邮箱
 - update-company: 按编号更新联系人所属公司
+- update-name:    按编号更新联系人姓名
 
 数据持久化在通过 --db 指定的 SQLite 数据库文件中，
 文件不存在时自动初始化，已存在则复用。
@@ -183,6 +184,17 @@ def cmd_update_company(args):
     )
 
 
+def cmd_update_name(args):
+    return update_contact_field(
+        args,
+        "name",
+        args.name,
+        bool,
+        "must not be empty",
+        "UPDATE contacts SET name = ? WHERE id = ?",
+    )
+
+
 def cmd_list(args):
     company = clean(args.company)
     if not company:
@@ -248,6 +260,13 @@ def build_parser():
     parser_update_company.add_argument("--id", required=True, help="联系人编号")
     parser_update_company.add_argument("--company", required=True, help="新公司名")
     parser_update_company.set_defaults(func=cmd_update_company)
+
+    parser_update_name = subparsers.add_parser(
+        "update-name", help="按编号更新姓名"
+    )
+    parser_update_name.add_argument("--id", required=True, help="联系人编号")
+    parser_update_name.add_argument("--name", required=True, help="新姓名")
+    parser_update_name.set_defaults(func=cmd_update_name)
 
     return parser
 
