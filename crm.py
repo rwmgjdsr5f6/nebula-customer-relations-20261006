@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS contacts (
 
 
 MAX_CONTACT_ID = 9223372036854775807
+MAX_CONTACT_ID_TEXT = str(MAX_CONTACT_ID)
 
 
 def fail(field, message):
@@ -42,15 +43,27 @@ def clean(value):
 
 
 def parse_contact_id(raw_value):
-    """清理编号首尾空白并校验为正整数（允许前导零），返回整数编号。"""
+    """清理编号首尾空白并校验为正整数（允许前导零），返回整数编号。
+
+    只接受 ASCII 数字，数值范围为 1 至 MAX_CONTACT_ID。先逐字符校验再按
+    十进制文本与上限比较长度和字典序，避免对超长字符串直接 int() 触发
+    Python 的整数转换长度限制（前导零不构成新的长度限制）。
+    """
     raw_id = clean(raw_value)
+    if not raw_id or not all("0" <= ch <= "9" for ch in raw_id):
+        fail("id", "must be a positive integer")
+
+    significant = raw_id.lstrip("0")
     if (
-        not raw_id
-        or not all("0" <= ch <= "9" for ch in raw_id)
-        or not 1 <= int(raw_id) <= MAX_CONTACT_ID
+        not significant
+        or len(significant) > len(MAX_CONTACT_ID_TEXT)
+        or (
+            len(significant) == len(MAX_CONTACT_ID_TEXT)
+            and significant > MAX_CONTACT_ID_TEXT
+        )
     ):
         fail("id", "must be a positive integer")
-    return int(raw_id)
+    return int(significant)
 
 
 def valid_email(email):
