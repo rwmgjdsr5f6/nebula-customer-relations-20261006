@@ -11,6 +11,7 @@
 - update-company: 按编号更新联系人所属公司
 - update-name:    按编号更新联系人姓名
 - delete:         按编号删除单条联系人
+- company-summary: 按公司汇总联系人数量（全量 JSON 输出）
 
 数据持久化在通过 --db 指定的 SQLite 数据库文件中，
 文件不存在时自动初始化，已存在则复用。
@@ -344,6 +345,29 @@ def cmd_list(args):
     return 0
 
 
+def cmd_company_summary(args):
+    """按完整公司名精确归组统计联系人数，输出 JSON 数组。
+
+    覆盖全部联系人，每条记录各计一次；仅返回至少有一位联系人的公司，
+    按公司名的 Unicode 码点顺序升序（SQLite 默认 BINARY 排序对 UTF-8
+    字节排序，与码点序一致；区分大小写并保留内部空格）。
+    """
+    conn = connect_db(args.db)
+    try:
+        rows = conn.execute(
+            "SELECT company, COUNT(*) FROM contacts"
+            " GROUP BY company ORDER BY company ASC"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    records = [
+        {"company": row[0], "contact_count": row[1]} for row in rows
+    ]
+    print(json.dumps(records, ensure_ascii=False))
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog="crm", description="本地客户关系管理台")
     parser.add_argument("--db", required=True, help="SQLite 数据库文件路径")
@@ -400,6 +424,11 @@ def build_parser():
     parser_delete = subparsers.add_parser("delete", help="按编号删除联系人")
     parser_delete.add_argument("--id", required=True, help="联系人编号")
     parser_delete.set_defaults(func=cmd_delete)
+
+    parser_company_summary = subparsers.add_parser(
+        "company-summary", help="按公司汇总联系人数量"
+    )
+    parser_company_summary.set_defaults(func=cmd_company_summary)
 
     return parser
 
