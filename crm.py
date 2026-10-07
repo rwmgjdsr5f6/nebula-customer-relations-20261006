@@ -4,7 +4,7 @@
 仅支持六个行为：
 - add:            新增联系人
 - list:           列出联系人（可按公司名精确筛选，省略公司时跨全部公司；
-                   JSON 或 CSV 输出）
+                   可用 --limit 限制返回条数；JSON 或 CSV 输出）
 - get:            按编号查看单条联系人
 - update-email:   按编号更新联系人邮箱
 - update-company: 按编号更新联系人所属公司
@@ -34,6 +34,10 @@ CREATE TABLE IF NOT EXISTS contacts (
 MAX_CONTACT_ID = 9223372036854775807
 MAX_CONTACT_ID_TEXT = str(MAX_CONTACT_ID)
 MAX_CONTACT_ID_DIGITS = len(MAX_CONTACT_ID_TEXT)
+
+MAX_LIMIT = 9223372036854775807
+MAX_LIMIT_TEXT = str(MAX_LIMIT)
+MAX_LIMIT_DIGITS = len(MAX_LIMIT_TEXT)
 
 
 def fail(field, message):
@@ -69,6 +73,28 @@ def parse_contact_id(raw_value):
         )
     ):
         fail("id", "must be a positive integer")
+    return int(digits)
+
+
+def parse_limit(raw_value):
+    """清理限额首尾空白并校验为正整数（允许前导零），返回整数限额。
+
+    规则与编号一致：只允许 ASCII 数字，数值范围为 1 至 MAX_LIMIT。
+    """
+    raw_limit = clean(raw_value)
+    if not raw_limit or not all("0" <= ch <= "9" for ch in raw_limit):
+        fail("limit", "must be a positive integer")
+
+    digits = raw_limit.lstrip("0")
+    if (
+        not digits
+        or len(digits) > MAX_LIMIT_DIGITS
+        or (
+            len(digits) == MAX_LIMIT_DIGITS
+            and digits > MAX_LIMIT_TEXT
+        )
+    ):
+        fail("limit", "must be a positive integer")
     return int(digits)
 
 
@@ -281,6 +307,10 @@ def cmd_list(args):
         if not valid_email(email):
             fail("email", "invalid email address")
 
+    limit = None
+    if args.limit is not None:
+        limit = parse_limit(args.limit)
+
     conditions = []
     parameters = []
     if company is not None:
@@ -299,6 +329,9 @@ def cmd_list(args):
         + where_sql
         + " ORDER BY id ASC"
     )
+    if limit is not None:
+        query_sql += " LIMIT ?"
+        parameters.append(limit)
 
     conn = connect_db(args.db)
     try:
@@ -344,6 +377,9 @@ def build_parser():
     parser_list.add_argument("--email", help="完整邮箱（精确匹配，区分大小写）")
     parser_list.add_argument(
         "--format", default="json", help="输出格式：json（默认）或 csv"
+    )
+    parser_list.add_argument(
+        "--limit", help="最多返回的联系人数（正整数，省略时返回全部匹配记录）"
     )
     parser_list.set_defaults(func=cmd_list)
 
