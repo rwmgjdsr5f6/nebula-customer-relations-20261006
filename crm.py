@@ -4,7 +4,8 @@
 仅支持六个行为：
 - add:            新增联系人
 - list:           列出联系人（可按公司名精确筛选，省略公司时跨全部公司；
-                   JSON 或 CSV 输出；可用 --limit 限制返回条数）
+                   JSON 或 CSV 输出；可用 --limit 限制返回条数；
+                   可用 --after-id 仅取编号严格大于该值的记录）
 - get:            按编号查看单条联系人
 - update-email:   按编号更新联系人邮箱
 - update-company: 按编号更新联系人所属公司
@@ -290,6 +291,10 @@ def cmd_list(args):
     if args.limit is not None:
         limit = parse_positive_int(args.limit, "limit")
 
+    after_id = None
+    if args.after_id is not None:
+        after_id = parse_positive_int(args.after_id, "after-id")
+
     conditions = []
     parameters = []
     if company is not None:
@@ -301,6 +306,9 @@ def cmd_list(args):
     if email is not None:
         conditions.append("email = ?")
         parameters.append(email)
+    if after_id is not None:
+        conditions.append("id > ?")
+        parameters.append(after_id)
 
     where_sql = (" WHERE " + " AND ".join(conditions)) if conditions else ""
     query_sql = (
@@ -359,6 +367,14 @@ def build_parser():
     )
     parser_list.add_argument(
         "--limit", help="最多返回的条数（正整数；省略时返回全部匹配记录）"
+    )
+    parser_list.add_argument(
+        "--after-id",
+        dest="after_id",
+        help=(
+            "仅返回编号严格大于该值的记录（正整数；边界编号无需存在；"
+            "省略时从编号最小的记录开始）"
+        ),
     )
     parser_list.set_defaults(func=cmd_list)
 
