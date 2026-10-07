@@ -3,7 +3,7 @@
 
 仅支持六个行为：
 - add:            新增联系人
-- list:           按公司名精确筛选联系人（JSON 或 CSV 输出）
+- list:           列出联系人（可按公司、姓名、邮箱筛选，JSON 或 CSV 输出）
 - get:            按编号查看单条联系人
 - update-email:   按编号更新联系人邮箱
 - update-company: 按编号更新联系人所属公司
@@ -262,9 +262,11 @@ def cmd_list(args):
     if output_format not in ("json", "csv"):
         fail("format", "must be json or csv")
 
-    company = clean(args.company)
-    if not company:
-        fail("company", "must not be empty")
+    company = None
+    if args.company is not None:
+        company = clean(args.company)
+        if not company:
+            fail("company", "must not be empty")
 
     name = None
     if args.name is not None:
@@ -278,8 +280,11 @@ def cmd_list(args):
         if not valid_email(email):
             fail("email", "invalid email address")
 
-    conditions = ["company = ?"]
-    parameters = [company]
+    conditions = []
+    parameters = []
+    if company is not None:
+        conditions.append("company = ?")
+        parameters.append(company)
     if name is not None:
         conditions.append("instr(name, ?) > 0")
         parameters.append(name)
@@ -287,11 +292,10 @@ def cmd_list(args):
         conditions.append("email = ?")
         parameters.append(email)
 
-    query_sql = (
-        "SELECT id, name, email, company FROM contacts WHERE "
-        + " AND ".join(conditions)
-        + " ORDER BY id ASC"
-    )
+    query_sql = "SELECT id, name, email, company FROM contacts"
+    if conditions:
+        query_sql += " WHERE " + " AND ".join(conditions)
+    query_sql += " ORDER BY id ASC"
 
     conn = connect_db(args.db)
     try:
@@ -329,8 +333,8 @@ def build_parser():
     parser_add.add_argument("--company", required=True, help="公司名")
     parser_add.set_defaults(func=cmd_add)
 
-    parser_list = subparsers.add_parser("list", help="按公司筛选联系人")
-    parser_list.add_argument("--company", required=True, help="公司名")
+    parser_list = subparsers.add_parser("list", help="列出联系人（可按公司筛选）")
+    parser_list.add_argument("--company", help="公司名（精确匹配，区分大小写）")
     parser_list.add_argument("--name", help="姓名子串（字面子串匹配，区分大小写）")
     parser_list.add_argument("--email", help="完整邮箱（精确匹配，区分大小写）")
     parser_list.add_argument(
