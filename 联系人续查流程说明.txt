@@ -1,0 +1,302 @@
+联系人续查流程说明——用 list 的 --after-id 连续读取同一公司的联系人
+====================================================================
+
+本说明只解释一件事：如何在不修改任何既有命令的前提下，用 crm.py 现有
+的 list 子命令（--company、--limit、--after-id）分批连续读取同一公司
+的联系人。本次只交付本说明，crm.py、tests/ 下的测试、数据库文件与
+其他文档均保持不变。
+
+文中所有结论均依据实际读取的仓库文件，引用格式为"相对路径:行号"：
+
+  - crm.py（命令行入口与全部业务逻辑，共 444 行）
+  - tests/test_list_after_id.py（list --after-id 续查行为的回归测试，
+    共 576 行）
+
+与仓库内其他核对说明不同，本文第五、六节的示例均未实际执行，是按
+源码与回归测试推导的预期结果，并逐处标注"预期结果"；编号的预期值
+依赖"全新数据库、按序插入"这一前提，前提不成立时以当次 add 输出的
+id 为准（见第五节开头的说明）。
+
+
+一、续查命令的公开入口与依据
+----------------------------
+
+续查不需要任何新命令，只用 list 子命令已有的三个参数，均由
+build_parser() 注册（crm.py:383-399）：
+
+    python crm.py --db <数据库文件> list --company <公司名> --limit <条数>
+    python crm.py --db <数据库文件> list --company <公司名> --limit <条数> --after-id <编号>
+
+  - --company：公司名精确匹配，区分大小写；省略时跨全部公司
+    （crm.py:384-386）。
+  - --limit：最多返回的条数，正整数；省略时返回全部匹配记录
+    （crm.py:392-394）。
+  - --after-id：仅返回编号严格大于该值的记录，正整数；省略时从首条
+    开始（crm.py:395-398）。它就是续查光标：第一批查出什么，就把
+    本批最后一条的编号作为下一批的 --after-id。
+  - 三个参数都可与 --name（姓名子串）、--email（完整邮箱）、
+    --format（json/csv）自由组合（crm.py:387-391），本文以公司
+    筛选为主线。
+
+处理函数是 cmd_list()（crm.py:268-345），解析与分派发生在 main()
+（crm.py:436-439）。
+
+
+二、参数校验的实际路径（全部发生在打开数据库之前）
+--------------------------------------------------
+
+cmd_list() 开头按固定顺序逐项校验，任一失败即由 fail() 拒绝，顺序为
+（crm.py:269-297）：
+
+  1. --format：必须是 json 或 csv（crm.py:269-271）；
+  2. --company：clean 后不能为空（crm.py:273-277）；
+  3. --name：clean 后不能为空（crm.py:279-283）；
+  4. --email：必须满足 valid_email()（crm.py:285-289）；
+  5. --limit：parse_positive_int(args.limit, "limit")
+     （crm.py:291-293）；
+  6. --after-id：parse_positive_int(args.after_id, "after-id")
+     （crm.py:295-297）。
+
+要点：
+
+  - 多个参数同时无效时只报告顺序最靠前的一个。特别是 --limit 与
+    --after-id 同时无效、其余参数合法时，先报告
+    limit: must be a positive integer（limit 的校验在 crm.py:291-293，
+    after-id 在 crm.py:295-297，limit 在前）。
+    tests/test_list_after_id.py:468-497
+    （test_error_order_reports_earlier_field_before_after_id）逐项
+    固定了这一报告顺序，其中条数用例在该文件第 477 行。
+  - --limit 与 --after-id 共用同一个校验函数 parse_positive_int()
+    （crm.py:52-74），只是字段名不同，因此两者的取值规则完全一致，
+    详见第六节。
+  - fail()（crm.py:41-44）把"<字段>: <消息>"一行写入标准错误，
+    标准输出保持为空，然后 sys.exit(2)。输入错误不产生 Python
+    异常堆栈，退出码统一为 2。
+  - 以上全部校验位于 connect_db()（crm.py:324）之前，因此参数被
+    拒绝时进程根本不打开数据库：指向尚不存在的数据库文件时该文件
+    不会被创建，指向已有库时库内记录不变。
+    tests/test_list_after_id.py:501-524
+    （test_invalid_after_id_does_not_create_missing_database）断言
+    无效 after-id 指向新路径后文件及其 SQLite 伴随文件都不出现；
+    tests/test_list_after_id.py:540-571
+    （test_after_id_queries_leave_records_unchanged）断言成功与失败
+    的续查之后，已有记录的内容、编号与顺序完整保留。
+
+
+三、组合筛选与编号排序的实际路径
+--------------------------------
+
+校验全部通过后，cmd_list() 把各条件拼进同一条 SELECT（crm.py:299-322）：
+
+  1. 条件按以下顺序加入 WHERE，彼此为 AND 交集（crm.py:299-312）：
+       - after-id：id > ?（crm.py:301-303）——严格大于，边界本身
+         不计入结果；
+       - company：company = ?（crm.py:304-306）——精确相等；
+       - name：instr(name, ?) > 0（crm.py:307-309）——字面子串；
+       - email：email = ?（crm.py:310-312）——精确相等。
+  2. 排序固定为 ORDER BY id ASC（crm.py:314-319），即按编号升序；
+     源码中不存在其他排序选项。
+  3. LIMIT 子句最后追加（crm.py:320-322）。因此语义是：先按全部
+     条件（含 id > 边界）过滤，按编号升序排列，再截取前 N 条——
+     而不是先取前 N 条再过滤。tests/test_list_after_id.py:306-319
+     （test_limit_applies_after_after_id_in_ascending_order）固定了
+     这一次序。
+
+由此得到续查的三条关键性质：
+
+  - 边界只表示编号下界。--after-id 的值只是一个"严格大于"的下界，
+    不要求边界编号对应任何真实记录：边界记录不存在、或已被 delete
+    删除，同一边界值照常可用，结果不变。
+    tests/test_list_after_id.py:323-334
+    （test_after_id_boundary_need_not_exist）与
+    tests/test_list_after_id.py:336-353
+    （test_deleted_contact_id_still_usable_as_boundary）分别覆盖
+    这两种情形。
+  - 省略边界保持原查询行为。--after-id 省略时 after_id 为 None，
+    既不校验也不加入条件（crm.py:295-297、301-303），查询与引入
+    续查之前完全相同。tests/test_list_after_id.py:208-218
+    （test_without_after_id_keeps_original_behavior）覆盖该行为。
+  - 其他筛选沿用现有语义。after-id 与公司、姓名、邮箱条件取交集，
+    并不改变这些条件各自的匹配规则。
+    tests/test_list_after_id.py:277-304
+    （test_after_id_intersects_name_and_email_filters）固定了交集
+    行为；姓名子串与邮箱精确匹配的规则本身见
+    联系人新增与筛选流程核对说明.txt，本文不重复。
+
+
+四、输出的实际路径
+------------------
+
+查询在 connect_db() 打开数据库后执行（crm.py:324-328），结果组装为
+含 id/name/email/company 四个键的记录列表（crm.py:330-333），随后
+按格式输出：
+
+  - JSON（默认）：json.dumps(..., ensure_ascii=False) 输出单行 JSON
+    数组到标准输出，中文不转义（crm.py:344）；无匹配时输出空数组
+    []，退出码仍为 0——无匹配不是错误。
+  - CSV：--format csv 时输出表头 id,name,email,company 加数据行，
+    行尾 CRLF，字段按 csv_field() 规则转义（crm.py:334-343、
+    259-265）；无匹配时只有表头一行。CSV 与 JSON 返回相同的记录
+    与顺序，续查不改变这一语义。
+    tests/test_list_after_id.py:357-413
+    （test_csv_matches_json_records_and_order）同时覆盖了两种格式
+    的一致性与空结果形态。
+  - 成功路径标准错误为空，退出码为 0；结果中不含页码、总数或
+    "下一页"字段，续查进度完全由调用方用 --after-id 自己维护。
+
+
+五、完整续查示例（预期结果，本节示例均未实际执行）
+--------------------------------------------------
+
+前提：工作目录为 crm.py 所在目录，且该目录下尚不存在
+contacts.sqlite3（父目录即当前目录，必然存在）。以下三条 add 在
+独立进程中依次执行，为全新数据库准备数据；编号预期为一、二、三，
+依据是 id 列为 INTEGER PRIMARY KEY AUTOINCREMENT（crm.py:26-33），
+全新库中首条插入得 1、其后依次递增，程序用 cursor.lastrowid 读回
+（crm.py:130）。换用已有数据库时编号取决于既有序列，应以当次 add
+的实际输出为准。这一准备序列与
+tests/test_list_after_id.py:139-159（seed_contacts）使用的固定样例
+完全一致。
+
+准备数据（公开输入及完整预期记录）：
+
+  1) 输入：
+       python crm.py --db contacts.sqlite3 add --name 林宁 --email lin@example.test --company 星河科技
+     预期结果：退出码 0，标准错误为空，标准输出一行：
+       {"id": 1, "name": "林宁", "email": "lin@example.test", "company": "星河科技"}
+
+  2) 输入：
+       python crm.py --db contacts.sqlite3 add --name 周岚 --email zhou@example.test --company 远帆咨询
+     预期结果：退出码 0，标准错误为空，标准输出一行：
+       {"id": 2, "name": "周岚", "email": "zhou@example.test", "company": "远帆咨询"}
+
+  3) 输入：
+       python crm.py --db contacts.sqlite3 add --name 许禾 --email xu@example.test --company 星河科技
+     预期结果：退出码 0，标准错误为空，标准输出一行：
+       {"id": 3, "name": "许禾", "email": "xu@example.test", "company": "星河科技"}
+
+第一批（取该公司第 1 条）：
+
+  输入：
+    python crm.py --db contacts.sqlite3 list --company 星河科技 --limit 1
+
+  预期结果：退出码 0，标准错误为空，标准输出一行完整 JSON 数组：
+    [{"id": 1, "name": "林宁", "email": "lin@example.test", "company": "星河科技"}]
+
+  解释：公司条件 company = '星河科技' 先筛掉编号二的周岚（远帆咨询
+  不满足精确相等，crm.py:304-306），剩余编号一、三按 id 升序排列
+  （crm.py:314-319），LIMIT 1 截断后只返回编号一的林宁
+  （crm.py:320-322）。对应回归案例
+  tests/test_list_after_id.py:222-231
+  （test_company_limit_without_after_id_returns_lin_ning）。
+
+第二批（同一命令末尾增加 --after-id 1）：
+
+  输入：
+    python crm.py --db contacts.sqlite3 list --company 星河科技 --limit 1 --after-id 1
+
+  预期结果：退出码 0，标准错误为空，标准输出一行完整 JSON 数组：
+    [{"id": 3, "name": "许禾", "email": "xu@example.test", "company": "星河科技"}]
+
+  解释：--after-id 1 加入条件 id > 1（crm.py:301-303），与公司条件
+  取交集。编号一的林宁因不满足"严格大于 1"被排除，不会重复出现；
+  编号二的周岚仍被公司条件排除；只剩编号三的许禾，升序后 LIMIT 1
+  原样返回。对应回归案例 tests/test_list_after_id.py:233-244
+  （test_company_limit_after_id_one_returns_xu_he）。
+
+继续以编号三续查（已读完全部）：
+
+  输入：
+    python crm.py --db contacts.sqlite3 list --company 星河科技 --limit 1 --after-id 3
+
+  预期结果：退出码 0，标准错误为空，标准输出一行：
+    []
+
+  解释：该公司编号大于 3 的记录不存在，交集为空；空数组是正常
+  结果而非错误（见第四节），调用方据此判断续查结束。对应回归案例
+  tests/test_list_after_id.py:264-275
+  （test_after_id_is_strict_greater_than，其中 after_id="3" 与
+  after_id="10" 均返回空数组）。
+
+续查要点回顾：每批把"本批最后一条的编号"作为下一批的 --after-id；
+边界只是编号下界，即使对应记录之后被删除，下一批查询也不受影响
+（tests/test_list_after_id.py:336-353）；任何时候省略 --after-id，
+查询都退回到第一批的原始行为（tests/test_list_after_id.py:208-218）。
+
+
+六、续查编号（--after-id）的真实边界
+------------------------------------
+
+取值规则全部来自 parse_positive_int()（crm.py:52-74），--limit 与
+--after-id 共用：
+
+  - 先去除首尾空白（crm.py:60，clean 即 value.strip()，crm.py:47-49）；
+  - 之后只接受 ASCII 数字 0-9，逐个字符检查（crm.py:61-62）；
+  - 允许任意数量的前导零：先剥离前导零再比较（crm.py:64）；
+  - 数值范围为一至 9223372036854775807（含）。上限即
+    MAX_CONTACT_ID（crm.py:36-38），比较方式是先比位数、同位数再
+    比字典序（crm.py:65-72），因此超长数字串在不触发 Python 整数
+    转换位数限制的情况下被安全拒绝。
+
+合法示例（预期结果，未实际执行）："1"、"001"、" 001 "、
+"9223372036854775807" 均被接受；其中 " 001 " 等价于 1，上限值合法
+（此时所有编号都不大于它，结果为空数组而非报错）。对应回归案例
+tests/test_list_after_id.py:417-428
+（test_after_id_with_whitespace_and_leading_zeros）与
+tests/test_list_after_id.py:430-442
+（test_after_id_max_int64_is_valid）。
+
+非法取值（在其他参数合法时）：空串、纯空白、零（含 "00"、" 0 "）、
+负数、小数、任何非 ASCII 数字（如全角数字、阿拉伯文数字、字母、
+科学计数法写法），以及超过上限的值（如 9223372036854775808），
+一律以退出码 2 结束，标准输出为空，标准错误仅一行：
+
+    after-id: must be a positive integer
+
+完整的非法取值清单见 tests/test_list_after_id.py:58-82
+（INVALID_AFTER_IDS），拒绝行为由
+tests/test_list_after_id.py:444-464
+（test_invalid_after_ids_are_rejected）逐值固定。
+
+与其他参数错误的先后：--limit 与 --after-id 同时无效且其他参数合法
+时，先报告 limit: must be a positive integer，退出码 2，标准输出为
+空（校验顺序见第二节，回归案例
+tests/test_list_after_id.py:468-497）。
+
+拒绝的副作用：参数拒绝发生在打开数据库之前（crm.py:295-297 对比
+crm.py:324），因此不创建新数据库文件，也不改变已有联系人
+（tests/test_list_after_id.py:501-524、540-571）。
+
+
+七、数据库文件相关行为
+----------------------
+
+  - 有效查询遇到尚不存在的数据库文件：connect_db() 会新建该文件并
+    初始化空表（crm.py:97-104，CREATE TABLE IF NOT EXISTS 在
+    crm.py:26-33），查询返回空数组 []，退出码 0。即"全新库上直接
+    续查"不是错误。对应回归案例
+    tests/test_list_after_id.py:513-524（
+    test_invalid_after_id_does_not_create_missing_database 的后半段：
+    合法 after-id 指向新路径时创建空库并返回空结果）。
+  - 父目录不存在：connect_db() 先用 Path(db_path).parent.is_dir()
+    检查（crm.py:99-100），以退出码 2 拒绝，标准输出为空，标准
+    错误仅一行：
+        db: parent directory does not exist
+    程序不会代为创建目录。对应回归案例
+    tests/test_list_after_id.py:526-536
+    （test_valid_query_with_missing_parent_directory_is_rejected）。
+  - 查询本身只读：成功的续查与失败的续查都不增删改任何联系人，
+    编号与字段内容保持不变
+    （tests/test_list_after_id.py:540-571）。
+
+
+八、本文未覆盖事项
+------------------
+
+  - add、get、update-*、delete、company-summary 的完整流程另有
+    对应说明文档，本文只在准备数据处引用 add 的预期行为；
+  - --name、--email 筛选与 --format csv 的完整规则沿用现有语义，
+    本文只说明它们与 --after-id 取交集、记录与顺序和 JSON 一致
+    （第三、四节），细节见联系人新增与筛选流程核对说明.txt；
+  - 多进程并发读写同一数据库的表现、数据库文件被外部改写后的
+    行为，已读材料中没有依据，不作推测。
