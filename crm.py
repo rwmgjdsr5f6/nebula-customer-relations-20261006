@@ -12,6 +12,8 @@
 - update-name:    按编号更新联系人姓名
 - delete:         按编号删除单条联系人
 - company-summary: 按公司汇总联系人数量（JSON 数组，按公司名 Unicode 码点升序）
+- add-note:       为指定联系人追加一条文本备注
+- list-notes:     按编号升序列出指定联系人的全部文本备注
 
 数据持久化在通过 --db 指定的 SQLite 数据库文件中，
 文件不存在时自动初始化，已存在则复用。
@@ -29,6 +31,14 @@ CREATE TABLE IF NOT EXISTS contacts (
     name TEXT NOT NULL,
     email TEXT NOT NULL,
     company TEXT NOT NULL
+)
+"""
+
+CREATE_NOTES_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    contact_id INTEGER NOT NULL,
+    text TEXT NOT NULL
 )
 """
 
@@ -100,6 +110,7 @@ def connect_db(db_path):
         fail("db", "parent directory does not exist")
     conn = sqlite3.connect(db_path)
     conn.execute(CREATE_TABLE_SQL)
+    conn.execute(CREATE_NOTES_TABLE_SQL)
     conn.commit()
     return conn
 
@@ -368,6 +379,72 @@ def cmd_company_summary(args):
     return 0
 
 
+def cmd_add_note(args):
+    """为指定联系人追加一条文本备注。
+
+    依次校验编号、正文、数据库路径与联系人是否存在；成功后输出只含
+    id/contact_id/text 的 JSON 对象。编号在同一数据库内按追加顺序递增。
+    """
+    contact_id = parse_contact_id(args.id)
+    text = clean(args.text)
+    if not text:
+        fail("text", "must not be empty")
+
+    conn = connect_db(args.db)
+    try:
+        contact = conn.execute(
+            "SELECT id FROM contacts WHERE id = ?",
+            (contact_id,),
+        ).fetchone()
+        if contact is None:
+            fail("id", "contact not found")
+        cursor = conn.execute(
+            "INSERT INTO notes (contact_id, text) VALUES (?, ?)",
+            (contact_id, text),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    record = {
+        "id": cursor.lastrowid,
+        "contact_id": contact_id,
+        "text": text,
+    }
+    print(json.dumps(record, ensure_ascii=False))
+    return 0
+
+
+def cmd_list_notes(args):
+    """按编号升序输出指定联系人的全部备注 JSON 数组。
+
+    联系人存在但没有备注时返回 []；合法编号找不到联系人时报错。
+    """
+    contact_id = parse_contact_id(args.id)
+
+    conn = connect_db(args.db)
+    try:
+        contact = conn.execute(
+            "SELECT id FROM contacts WHERE id = ?",
+            (contact_id,),
+        ).fetchone()
+        if contact is None:
+            fail("id", "contact not found")
+        rows = conn.execute(
+            "SELECT id, contact_id, text FROM notes"
+            " WHERE contact_id = ? ORDER BY id ASC",
+            (contact_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    records = [
+        {"id": row[0], "contact_id": row[1], "text": row[2]} for row in rows
+    ]
+    print(json.dumps(records, ensure_ascii=False))
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog="crm", description="本地客户关系管理台")
     parser.add_argument("--db", required=True, help="SQLite 数据库文件路径")
@@ -429,6 +506,17 @@ def build_parser():
         "company-summary", help="按公司汇总联系人数量"
     )
     parser_company_summary.set_defaults(func=cmd_company_summary)
+
+    parser_add_note = subparsers.add_parser("add-note", help="为联系人追加文本备注")
+    parser_add_note.add_argument("--id", required=True, help="联系人编号")
+    parser_add_note.add_argument("--text", required=True, help="备注正文")
+    parser_add_note.set_defaults(func=cmd_add_note)
+
+    parser_list_notes = subparsers.add_parser(
+        "list-notes", help="按编号升序列出联系人的全部文本备注"
+    )
+    parser_list_notes.add_argument("--id", required=True, help="联系人编号")
+    parser_list_notes.set_defaults(func=cmd_list_notes)
 
     return parser
 
