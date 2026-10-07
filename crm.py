@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """本地客户关系管理台命令行入口。
 
-仅支持五个行为：
+仅支持六个行为：
 - add:            新增联系人
 - list:           按公司名精确筛选联系人
+- get:            按编号查看单条联系人
 - update-email:   按编号更新联系人邮箱
 - update-company: 按编号更新联系人所属公司
 - update-name:    按编号更新联系人姓名
@@ -195,6 +196,31 @@ def cmd_update_name(args):
     )
 
 
+def cmd_get(args):
+    contact_id = parse_contact_id(args.id)
+
+    conn = connect_db(args.db)
+    try:
+        row = conn.execute(
+            "SELECT id, name, email, company FROM contacts WHERE id = ?",
+            (contact_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if row is None:
+        fail("id", "contact not found")
+
+    record = {
+        "id": row[0],
+        "name": row[1],
+        "email": row[2],
+        "company": row[3],
+    }
+    print(json.dumps(record, ensure_ascii=False))
+    return 0
+
+
 def cmd_list(args):
     company = clean(args.company)
     if not company:
@@ -248,6 +274,10 @@ def build_parser():
     parser_list.add_argument("--company", required=True, help="公司名")
     parser_list.add_argument("--name", help="姓名子串（字面子串匹配，区分大小写）")
     parser_list.set_defaults(func=cmd_list)
+
+    parser_get = subparsers.add_parser("get", help="按编号查看联系人")
+    parser_get.add_argument("--id", required=True, help="联系人编号")
+    parser_get.set_defaults(func=cmd_get)
 
     parser_update = subparsers.add_parser("update-email", help="按编号更新邮箱")
     parser_update.add_argument("--id", required=True, help="联系人编号")
