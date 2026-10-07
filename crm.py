@@ -8,6 +8,7 @@
 - update-email:   按编号更新联系人邮箱
 - update-company: 按编号更新联系人所属公司
 - update-name:    按编号更新联系人姓名
+- delete:         按编号删除单条联系人
 
 数据持久化在通过 --db 指定的 SQLite 数据库文件中，
 文件不存在时自动初始化，已存在则复用。
@@ -221,6 +222,32 @@ def cmd_get(args):
     return 0
 
 
+def cmd_delete(args):
+    contact_id = parse_contact_id(args.id)
+
+    conn = connect_db(args.db)
+    try:
+        row = conn.execute(
+            "SELECT id, name, email, company FROM contacts WHERE id = ?",
+            (contact_id,),
+        ).fetchone()
+        if row is None:
+            fail("id", "contact not found")
+        conn.execute("DELETE FROM contacts WHERE id = ?", (contact_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    record = {
+        "id": row[0],
+        "name": row[1],
+        "email": row[2],
+        "company": row[3],
+    }
+    print(json.dumps(record, ensure_ascii=False))
+    return 0
+
+
 def cmd_list(args):
     company = clean(args.company)
     if not company:
@@ -307,6 +334,10 @@ def build_parser():
     parser_update_name.add_argument("--id", required=True, help="联系人编号")
     parser_update_name.add_argument("--name", required=True, help="新姓名")
     parser_update_name.set_defaults(func=cmd_update_name)
+
+    parser_delete = subparsers.add_parser("delete", help="按编号删除联系人")
+    parser_delete.add_argument("--id", required=True, help="联系人编号")
+    parser_delete.set_defaults(func=cmd_delete)
 
     return parser
 
