@@ -3,7 +3,7 @@
 
 仅支持六个行为：
 - add:            新增联系人
-- list:           按公司名精确筛选联系人
+- list:           按公司名精确筛选联系人（JSON 或 CSV 输出）
 - get:            按编号查看单条联系人
 - update-email:   按编号更新联系人邮箱
 - update-company: 按编号更新联系人所属公司
@@ -248,7 +248,20 @@ def cmd_delete(args):
     return 0
 
 
+def csv_field(value):
+    """按 CSV 规则转义单个字段：含逗号、双引号、回车或换行时加双引号，
+    内部双引号写成两个，其余字段保持原值。"""
+    text = str(value)
+    if any(ch in text for ch in (",", '"', "\r", "\n")):
+        return '"' + text.replace('"', '""') + '"'
+    return text
+
+
 def cmd_list(args):
+    output_format = args.format
+    if output_format not in ("json", "csv"):
+        fail("format", "must be json or csv")
+
     company = clean(args.company)
     if not company:
         fail("company", "must not be empty")
@@ -290,6 +303,16 @@ def cmd_list(args):
         {"id": row[0], "name": row[1], "email": row[2], "company": row[3]}
         for row in rows
     ]
+    if output_format == "csv":
+        lines = ["id,name,email,company"]
+        for record in records:
+            lines.append(
+                ",".join(
+                    csv_field(record[key]) for key in ("id", "name", "email", "company")
+                )
+            )
+        sys.stdout.write("".join(line + "\r\n" for line in lines))
+        return 0
     print(json.dumps(records, ensure_ascii=False))
     return 0
 
@@ -310,6 +333,9 @@ def build_parser():
     parser_list.add_argument("--company", required=True, help="公司名")
     parser_list.add_argument("--name", help="姓名子串（字面子串匹配，区分大小写）")
     parser_list.add_argument("--email", help="完整邮箱（精确匹配，区分大小写）")
+    parser_list.add_argument(
+        "--format", default="json", help="输出格式：json（默认）或 csv"
+    )
     parser_list.set_defaults(func=cmd_list)
 
     parser_get = subparsers.add_parser("get", help="按编号查看联系人")
