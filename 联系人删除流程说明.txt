@@ -1,0 +1,428 @@
+联系人删除流程说明（delete）——源码核对说明
+============================================
+
+本文以如下命令为入口，核对 crm.py 中 delete 子命令"按编号删除单条
+联系人"的现有公开行为，覆盖参数解析、编号清理校验、数据库访问、
+查找记录、删除提交与输出的先后关系：
+
+    python crm.py --db contacts.sqlite3 delete --id " 001 "
+
+依据与标注约定：
+
+- 文中结论均来自对当前仓库源码 crm.py 与回归测试
+  tests/test_delete_contact.py 的阅读，引用格式为"相对路径:行号"，
+  例如 crm.py:231 指 crm.py 第 231 行。
+- 本文档编写时未实际执行任何 crm.py 命令；第六节的全部命令输出都是
+  依据源码推导的"预期结果"，不是实测结论。tests/test_delete_contact.py
+  以子进程方式固定了同样的期望（测试运行方式见该文件
+  tests/test_delete_contact.py:22：在项目根目录执行
+  python -m unittest discover -s tests），可用测试自行核对。
+- 本次仅交付本文档。crm.py 产品代码、tests/ 现有测试、README.md、
+  数据库结构以及 add/get/list、update-email/update-company/
+  update-name 等其他公开命令的行为均保持不变；样例中的 add、get、
+  list 仅用于准备数据和核对删除结果。
+
+
+一、入口与参数解析
+------------------
+
+1. --db 是顶层解析器参数（crm.py:341，required=True），必须写在
+   子命令 delete 之前；入口命令中的写法符合这一要求。delete 是
+   子命令之一（crm.py:388-390），其 --id 同样 required=True
+   （crm.py:389），处理函数通过 set_defaults 绑定为 cmd_delete
+   （crm.py:390）。
+
+2. main()（crm.py:395-398）先用 parser.parse_args(argv)
+   （crm.py:397）解析命令行，再调用 args.func(args)
+   （crm.py:398）分派到 cmd_delete(args)；脚本入口
+   sys.exit(main())（crm.py:401-402）使 cmd_delete 的返回值成为
+   进程退出码（成功返回 0，见 crm.py:254）。
+
+3. shell 中 --id 的参数写成带引号的 " 001 "，引号由 shell 处理，
+   argparse 收到的参数值是含首尾空格的字符串 " 001 " 本身；
+   argparse 不做任何去空白或类型转换（delete 的 --id 未指定 type，
+   见 crm.py:389），原样交给 cmd_delete。空格的剥离发生在业务代码
+   中，见第二节。
+
+
+二、编号清理与校验（第一步，先于数据库访问）
+---------------------------------------------
+
+cmd_delete 的第一条语句就是编号解析（crm.py:232）：
+
+    contact_id = parse_contact_id(args.id)
+
+parse_contact_id()（crm.py:75-77）转调
+parse_positive_int(raw_value, "id")（crm.py:50-72），处理顺序为：
+
+1. 清理首尾空白（crm.py:58 调用 clean()）。clean() 的实现只有
+   value.strip()（crm.py:45-47）：去掉首尾空白（空格、制表符等），
+   内部字符与大小写不涉及（编号只接受数字）。因此 " 001 " 先变为
+   "001"。
+
+2. 非空且全部字符为 ASCII 数字（crm.py:59）：
+   all("0" <= ch <= "9" for ch in raw_text)。这是逐字符的 ASCII
+   范围比较，只认 "0" 至 "9" 十个字符。清理后为空串，或含任何
+   非 ASCII 数字字符，都在 crm.py:60 调用
+   fail("id", "must be a positive integer")。
+
+3. 剥离前导零（crm.py:62，raw_text.lstrip("0")），允许任意数量的
+   前导零："001" 变为 "1"，"  0001  " 清理后同样等价于 1。
+
+4. 取值范围校验（crm.py:63-71）。上限常量 MAX_CONTACT_ID =
+   9223372036854775807（crm.py:34，即 64 位有符号整数上限）。
+   - 剥离前导零后为空（如 "0"、"000"），拒绝；
+   - 有效位数超过 19 位，拒绝（位数比较，crm.py:65）；
+   - 恰好 19 位时按字符串字典序与 "9223372036854775807"
+     （crm.py:35）比较，更大则拒绝（crm.py:67-68），因此
+     "9223372036854775808" 被拒，"9223372036854775807" 本身通过；
+   - 通过后才对剥离前导零的数字串调用 int()（crm.py:72），
+     "001" 得到整数 1。
+
+合法取值为整数 1 至 9223372036854775807，允许前导零。测试集中
+INVALID_IDS（tests/test_delete_contact.py:40-51）固定了下列非法
+样例，全部预期得到 id: must be a positive integer：
+
+  - ""（空串）、"   "、" \t "（纯空白）：strip 后为空，
+    命中 crm.py:59 的 not raw_text；
+  - "0"：剥离前导零后为空串，命中 crm.py:64；
+  - "-1"（负数）、"1.5"（小数）："-"、"." 不是 ASCII 数字，
+    命中 crm.py:59；
+  - "abc"、"1a"（含字母）：同上；
+  - "１"（全角数字 1，U+FF11）：不属于 ASCII 的 "0"-"9"，
+    命中 crm.py:59；
+  - "9223372036854775808"：超出上限，命中 crm.py:67-68。
+
+fail()（crm.py:39-42）把 "id: must be a positive integer" 一行
+打印到标准错误（crm.py:41，print 自带行尾换行），随即
+sys.exit(2)（crm.py:42）。由于这一切发生在 connect_db()
+（crm.py:234）之前，编号无效时进程根本不访问文件系统与数据库：
+
+- 不会创建新数据库文件（对不存在的 --db 路径亦然），
+  对应 tests/test_delete_contact.py:251-260；
+- 已有数据库中的联系人完全不变，
+  对应 tests/test_delete_contact.py:237-249；
+- 当编号无效且 --db 的父目录也不存在时，只报编号错误，
+  不报告、也不创建缺失的目录或文件，
+  对应 tests/test_delete_contact.py:306-316。
+
+
+三、数据库访问与建库时机（第二步）
+----------------------------------
+
+编号校验通过后，cmd_delete 调用 connect_db(args.db)（crm.py:234，
+实现见 crm.py:95-102）：
+
+1. 父目录检查（crm.py:97）：Path(db_path).parent.is_dir()。
+   父目录不存在时，crm.py:98 调用
+   fail("db", "parent directory does not exist") 后退出码 2 结束；
+   由于 sqlite3.connect() 尚未调用（在 crm.py:99），不会代为创建
+   任何目录或文件。对入口命令的相对路径 contacts.sqlite3 而言，
+   父目录是当前工作目录 "."，正常存在。
+   对应测试：tests/test_delete_contact.py:296-304。
+
+2. 连接与初始化（crm.py:99-101）：父目录存在时
+   sqlite3.connect(db_path) 打开数据库——文件不存在则新建空文件，
+   已存在则原样复用；随后执行 CREATE TABLE IF NOT EXISTS contacts
+   （CREATE_TABLE_SQL，crm.py:24-31）并 commit（crm.py:101）。
+   表结构为 id INTEGER PRIMARY KEY AUTOINCREMENT、name/email/
+   company 均为 TEXT NOT NULL（crm.py:25-30）。
+
+一个需要明确的边界：父目录存在而数据库文件不存在时，只要编号合法，
+delete 会先在 crm.py:99-101 新建一个只含空 contacts 表的数据库并
+提交，随后第四节的查找因表中无行而报告 id: contact not found；
+命令失败，但这个新建的空数据库文件会保留下来，此后对它执行 list
+返回空数组 []。该现有语义由
+tests/test_delete_contact.py:282-292 固定。
+
+
+四、查找记录、删除提交与输出（第三步及之后）
+--------------------------------------------
+
+数据库连接就绪后，cmd_delete 在 try/finally 中依次执行
+（crm.py:235-245）：
+
+1. 查找记录（crm.py:236-239）：用参数化语句
+       SELECT id, name, email, company FROM contacts WHERE id = ?
+   以清理校验后得到的整数编号为参数 fetchone()。
+
+2. 未找到即失败（crm.py:240-241）：row is None 时调用
+   fail("id", "contact not found")，标准错误输出
+   "id: contact not found"、退出码 2。此时不会执行 DELETE；
+   fail 抛出的 SystemExit 仍会经过 finally 关闭连接
+   （crm.py:244-245）。合法但从未保存过的编号（如 99），以及
+   此前已被删除的编号，都走这一分支。
+   对应测试：tests/test_delete_contact.py:264-280（未保存编号）、
+   tests/test_delete_contact.py:193-211（删除后 get 与再次 delete）。
+
+3. 删除目标行（crm.py:242）：
+       DELETE FROM contacts WHERE id = ?
+   语句以主键 id 为条件，只影响目标编号这一行，其他联系人的编号与
+   字段不变。对应 tests/test_delete_contact.py:178-191。
+
+4. 提交（crm.py:243）：conn.commit() 提交事务，
+   删除在此持久化；finally 块中 conn.close()（crm.py:244-245）。
+   每条命令都是独立的 Python 进程（测试同样逐次子进程执行，
+   见 tests/test_delete_contact.py:61-66）：因为提交发生在进程结束
+   之前，后续新启动的 list/get/delete 进程打开同一数据库文件时，
+   读到的就是删除提交后的状态。
+
+5. 组装并输出删除前的完整对象（crm.py:247-253）：记录字典由第 1 步
+   删除前查到的 row 构建（crm.py:247-252），字段与顺序为
+   id、name、email、company，再以
+   print(json.dumps(record, ensure_ascii=False))（crm.py:253）输出
+   单行 JSON，中文不转义、邮箱大小写保持原样。这与 add 成功时的
+   输出方式一致（crm.py:127-133）；测试明确断言 delete 的标准输出
+   与该联系人 add 时的原始标准输出逐字节相同
+   （tests/test_delete_contact.py:170）。
+
+6. cmd_delete 返回 0（crm.py:254），进程退出码为 0；成功路径上
+   不向标准错误写入任何内容（测试断言 stderr 为空，
+   见 tests/test_delete_contact.py:169、断言助手
+   tests/test_delete_contact.py:82-95）。
+
+注意输出在提交与关闭连接之后才打印：先提交删除，再输出被删对象，
+两者顺序不会颠倒。
+
+
+五、三类错误的统一契约与判定优先级
+----------------------------------
+
+delete 的错误信息恰有三类：
+
+  情形                         标准错误唯一一行
+  ---------------------------  ------------------------------------------
+  编号清理/校验未通过           id: must be a positive integer
+  （crm.py:60、crm.py:71）
+  编号合法但库中无此编号        id: contact not found
+  （crm.py:241，含已删除编号）
+  --db 父目录不存在             db: parent directory does not exist
+  （crm.py:98）
+
+三类错误共享同一契约，由 fail()（crm.py:39-42）保证，并由断言助手
+assert_delete_rejected 统一固定
+（tests/test_delete_contact.py:97-106）：
+
+- 退出码为 2（crm.py:42；tests/test_delete_contact.py:102）；
+- 标准输出为空（crm.py:41 只写 stderr；
+  tests/test_delete_contact.py:103）；
+- 标准错误恰为对应一行加行尾换行，即 "消息\n"，无其他内容、无
+  Traceback 堆栈（print 自带换行；
+  tests/test_delete_contact.py:104-106）；
+- 已有联系人保持不变（无效编号见
+  tests/test_delete_contact.py:237-249；未找到见
+  tests/test_delete_contact.py:271-280；父目录缺失时本来就没有
+  任何写入，见 tests/test_delete_contact.py:296-304）。
+
+判定优先级（短路，前一步失败则后续步骤完全不发生）：
+
+  编号清理校验  →  父目录检查  →  建连/建表  →  按编号查找
+  （crm.py:232）  （crm.py:97-98） （crm.py:99-101）（crm.py:236-241）
+
+因此：编号与父目录同时有问题时只报编号错误；父目录缺失时即便编号
+在库中本就不存在，也只报父目录错误（查找根本不会执行）。
+
+
+六、固定样例：全新数据库准备命令与完整预期结果
+----------------------------------------------
+
+【说明】以下输出全部为依据源码的预期结果，编写本文档时未实际执行。
+前提：在 crm.py 所在目录（仓库根目录）执行，且 contacts.sqlite3
+事先不存在（全新数据库）。固定编号 1、2、3 仅适用于这次全新库按序
+插入——id 为 INTEGER PRIMARY KEY AUTOINCREMENT（crm.py:26），
+add 取 cursor.lastrowid 输出（crm.py:128），测试同样只在全新库断言
+1、2、3（tests/test_delete_contact.py:150-155）；复用旧库或插入后
+再删插，编号都可能不同。
+
+准备：确保全新库（contacts.sqlite3 已被 .gitignore 忽略，
+不会进入版本控制）：
+
+    rm -f contacts.sqlite3
+
+1) 新增星河科技的林宁
+
+    python crm.py --db contacts.sqlite3 add --name 林宁 --email Lin@example.test --company 星河科技
+
+   预期结果：退出码 0，标准错误为空，标准输出一行：
+
+    {"id": 1, "name": "林宁", "email": "Lin@example.test", "company": "星河科技"}
+
+2) 新增星河科技的许禾
+
+    python crm.py --db contacts.sqlite3 add --name 许禾 --email xu@example.test --company 星河科技
+
+   预期结果：退出码 0，标准错误为空，标准输出一行：
+
+    {"id": 2, "name": "许禾", "email": "xu@example.test", "company": "星河科技"}
+
+3) 新增远帆咨询的周岚
+
+    python crm.py --db contacts.sqlite3 add --name 周岚 --email zhou@example.test --company 远帆咨询
+
+   预期结果：退出码 0，标准错误为空，标准输出一行：
+
+    {"id": 3, "name": "周岚", "email": "zhou@example.test", "company": "远帆咨询"}
+
+4) 入口命令：带首尾空白与前导零删除编号 1
+
+    python crm.py --db contacts.sqlite3 delete --id " 001 "
+
+   " 001 " 经 strip 与剥离前导零后为整数 1（crm.py:58、
+   crm.py:62、crm.py:72）。预期结果：退出码 0，标准错误为空，
+   标准输出为林宁删除前的完整 JSON 对象，与其第 1 步 add 的输出
+   逐字节相同（单行、行尾换行）：
+
+    {"id": 1, "name": "林宁", "email": "Lin@example.test", "company": "星河科技"}
+
+5) 删除后重新 list：只剩许禾和周岚，字段不变，按 id 升序
+
+    python crm.py --db contacts.sqlite3 list
+
+   预期结果（退出码 0，标准错误为空）：
+
+    [{"id": 2, "name": "许禾", "email": "xu@example.test", "company": "星河科技"}, {"id": 3, "name": "周岚", "email": "zhou@example.test", "company": "远帆咨询"}]
+
+   按公司核对，星河科技只剩许禾：
+
+    python crm.py --db contacts.sqlite3 list --company 星河科技
+
+   预期结果：
+
+    [{"id": 2, "name": "许禾", "email": "xu@example.test", "company": "星河科技"}]
+
+   远帆咨询仍为周岚：
+
+    python crm.py --db contacts.sqlite3 list --company 远帆咨询
+
+   预期结果：
+
+    [{"id": 3, "name": "周岚", "email": "zhou@example.test", "company": "远帆咨询"}]
+
+   get 许禾、周岚同样返回各自原始 JSON 对象（cmd_get，
+   crm.py:206-228），编号与字段不变（测试
+   tests/test_delete_contact.py:190-191）。
+
+6) get 已删除的编号 1：未找到
+
+    python crm.py --db contacts.sqlite3 get --id 1
+
+   预期结果：退出码 2，标准输出为空，标准错误恰为一行：
+
+    id: contact not found
+
+7) 再次 delete 编号 1（用带空白与更多前导零的等价写法）：未找到
+
+    python crm.py --db contacts.sqlite3 delete --id "  0001  "
+
+   预期结果：退出码 2，标准输出为空，标准错误恰为一行：
+
+    id: contact not found
+
+   上述两次失败调用不影响剩余记录；再次执行第 5 步的 list，结果
+   仍只有许禾、周岚（tests/test_delete_contact.py:193-224）。
+
+8) 编号校验错误样例（在第 4 步后的同一库上执行）
+
+    python crm.py --db contacts.sqlite3 delete --id "   "
+    python crm.py --db contacts.sqlite3 delete --id "0"
+    python crm.py --db contacts.sqlite3 delete --id "-1"
+    python crm.py --db contacts.sqlite3 delete --id "1.5"
+    python crm.py --db contacts.sqlite3 delete --id "１"
+    python crm.py --db contacts.sqlite3 delete --id "9223372036854775808"
+
+   每条预期均为：退出码 2，标准输出为空，标准错误恰为一行
+   （"１" 需加引号传给 shell）：
+
+    id: must be a positive integer
+
+   调用后许禾、周岚两条记录保持不变。
+
+9) 合法但不存在的编号：未找到
+
+    python crm.py --db contacts.sqlite3 delete --id 99
+
+   预期结果：退出码 2，标准输出为空，标准错误恰为一行：
+
+    id: contact not found
+
+10) 父目录缺失且编号合法：只报数据库父目录错误，不创建任何东西
+
+    python crm.py --db no-such-parent/contacts.sqlite3 delete --id 1
+
+   预期结果：退出码 2，标准输出为空，标准错误恰为一行：
+
+    db: parent directory does not exist
+
+   no-such-parent/ 目录与其下文件预期均不会被创建。
+
+11) 父目录缺失且编号也无效：编号错误优先
+
+    python crm.py --db no-such-parent/contacts.sqlite3 delete --id 0
+
+   预期结果：退出码 2，标准输出为空，标准错误恰为一行：
+
+    id: must be a positive integer
+
+   同样不创建目录或文件（编号校验先于父目录检查）。
+
+12) 父目录存在而数据库文件不存在、编号合法：先建空库再报未找到
+
+    python crm.py --db fresh-empty.sqlite3 delete --id 99
+
+   预期结果：退出码 2，标准输出为空，标准错误恰为一行：
+
+    id: contact not found
+
+   同时 fresh-empty.sqlite3 被创建为含空 contacts 表的数据库；
+   随后对它查询返回空数组：
+
+    python crm.py --db fresh-empty.sqlite3 list
+
+   预期结果（退出码 0，标准错误为空）：
+
+    []
+
+   样例结束后可自行删除 contacts.sqlite3 与 fresh-empty.sqlite3。
+
+
+七、关键结论与源码、测试用例对照表
+----------------------------------
+
+结论                                              源码                测试（tests/test_delete_contact.py）
+------------------------------------------------  ------------------  ----------------------------------------
+--db 为顶层必填参数，delete --id 必填，           crm.py:341、        子进程调用助手 run_crm：
+main 解析后分派 cmd_delete                         388-390、395-398    61-66
+
+编号先 strip 首尾空白，且只接受 ASCII 数字        crm.py:45-47、      INVALID_IDS 清单 40-51；
+                                                  58-60               非法编号拒绝 228-235
+
+允许前导零，取值 1 至 9223372036854775807，       crm.py:34-36、      " 001 " 成功删除 160-176；
+零/负数/小数/字母/全角数字/超范围均拒绝           62-72、75-77        再次删除 "  0001  " 193-211；
+                                                                      非法编号 228-235
+
+fail 统一为 stderr 一行 + 换行、退出码 2、        crm.py:39-42        assert_delete_rejected 97-106
+stdout 为空、无堆栈                                                   （102-106）
+
+编号校验先于数据库访问：无效编号不创建新库、      crm.py:232 先于     无效编号不建库 251-260；
+不触碰已有记录；编号与父目录同时无效时只报编号    crm.py:234          失败后记录不变 237-249；
+错误                                                                   双无效只报编号 306-316
+
+父目录缺失报 db: parent directory does not        crm.py:95-99        合法编号/缺失父目录 296-304
+exist，且不创建目录或文件
+
+父目录存在、文件不存在且编号合法时，先创建空库    crm.py:99-101 配合  建空库后报未找到、再 list 为空：
+（含 contacts 表）再报 contact not found，文件    crm.py:240-241      282-292
+保留
+
+查找使用参数化 SELECT，无此行报 id: contact       crm.py:236-241      未保存编号 264-280；
+not found；不会执行 DELETE                                           删除后 get/再删 193-211
+
+DELETE 只按主键移除目标行，commit 提交，          crm.py:242-245      只删目标、其他人字段不变 178-191；
+finally 关闭连接                                                     二次删除仅首次成功 213-224
+
+成功时输出删除前的完整 JSON 对象（id/name/        crm.py:247-254，    stdout 与 add 结果逐字节相同：
+email/company 四字段，中文与邮箱大小写原样），    对照 add 127-133    160-176（170）
+退出码 0、stderr 为空
+
+提交先于输出且发生在进程结束前，后续独立进程      crm.py:243、        删后跨进程 list/get 核对 178-211
+（新的 list/get/delete 调用）可读到删除结果       244-245             （每次均为独立子进程，61-66）
