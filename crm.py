@@ -232,21 +232,29 @@ def cmd_list(args):
         if not name:
             fail("name", "must not be empty")
 
+    email = None
+    if args.email is not None:
+        email = clean(args.email)
+        if not valid_email(email):
+            fail("email", "invalid email address")
+
+    conditions = ["company = ?"]
+    params = [company]
+    if name is not None:
+        conditions.append("instr(name, ?) > 0")
+        params.append(name)
+    if email is not None:
+        conditions.append("email = ?")
+        params.append(email)
+
     conn = connect_db(args.db)
     try:
-        if name is None:
-            rows = conn.execute(
-                "SELECT id, name, email, company "
-                "FROM contacts WHERE company = ? ORDER BY id ASC",
-                (company,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT id, name, email, company "
-                "FROM contacts WHERE company = ? AND instr(name, ?) > 0 "
-                "ORDER BY id ASC",
-                (company, name),
-            ).fetchall()
+        rows = conn.execute(
+            "SELECT id, name, email, company FROM contacts WHERE "
+            + " AND ".join(conditions)
+            + " ORDER BY id ASC",
+            params,
+        ).fetchall()
     finally:
         conn.close()
 
@@ -273,6 +281,7 @@ def build_parser():
     parser_list = subparsers.add_parser("list", help="按公司筛选联系人")
     parser_list.add_argument("--company", required=True, help="公司名")
     parser_list.add_argument("--name", help="姓名子串（字面子串匹配，区分大小写）")
+    parser_list.add_argument("--email", help="邮箱（完整字符串精确匹配，区分大小写）")
     parser_list.set_defaults(func=cmd_list)
 
     parser_get = subparsers.add_parser("get", help="按编号查看联系人")
