@@ -4,7 +4,7 @@
 仅支持六个行为：
 - add:            新增联系人
 - list:           列出联系人（可按公司名精确筛选，省略公司时跨全部公司；
-                   JSON 或 CSV 输出）
+                   JSON 或 CSV 输出；可用 --limit 限制返回条数）
 - get:            按编号查看单条联系人
 - update-email:   按编号更新联系人邮箱
 - update-company: 按编号更新联系人所属公司
@@ -47,19 +47,19 @@ def clean(value):
     return value.strip()
 
 
-def parse_contact_id(raw_value):
-    """清理编号首尾空白并校验为正整数（允许前导零），返回整数编号。
+def parse_positive_int(raw_value, field):
+    """清理首尾空白并校验为正整数（允许前导零），返回整数值。
 
     只允许 ASCII 数字，数值范围为 1 至 MAX_CONTACT_ID。先剥离前导零再按
     位数与字典序比较上限，仅对不超过上限位数的数字串调用 int()，从而在
-    Python 3.11 默认的整数字符串转换位数限制下仍能安全处理超长编号，
+    Python 3.11 默认的整数字符串转换位数限制下仍能安全处理超长数字，
     且不额外限制前导零的数量。
     """
-    raw_id = clean(raw_value)
-    if not raw_id or not all("0" <= ch <= "9" for ch in raw_id):
-        fail("id", "must be a positive integer")
+    raw_text = clean(raw_value)
+    if not raw_text or not all("0" <= ch <= "9" for ch in raw_text):
+        fail(field, "must be a positive integer")
 
-    digits = raw_id.lstrip("0")
+    digits = raw_text.lstrip("0")
     if (
         not digits
         or len(digits) > MAX_CONTACT_ID_DIGITS
@@ -68,8 +68,13 @@ def parse_contact_id(raw_value):
             and digits > MAX_CONTACT_ID_TEXT
         )
     ):
-        fail("id", "must be a positive integer")
+        fail(field, "must be a positive integer")
     return int(digits)
+
+
+def parse_contact_id(raw_value):
+    """清理编号首尾空白并校验为正整数（允许前导零），返回整数编号。"""
+    return parse_positive_int(raw_value, "id")
 
 
 def valid_email(email):
@@ -281,6 +286,10 @@ def cmd_list(args):
         if not valid_email(email):
             fail("email", "invalid email address")
 
+    limit = None
+    if args.limit is not None:
+        limit = parse_positive_int(args.limit, "limit")
+
     conditions = []
     parameters = []
     if company is not None:
@@ -299,6 +308,9 @@ def cmd_list(args):
         + where_sql
         + " ORDER BY id ASC"
     )
+    if limit is not None:
+        query_sql += " LIMIT ?"
+        parameters.append(limit)
 
     conn = connect_db(args.db)
     try:
@@ -344,6 +356,9 @@ def build_parser():
     parser_list.add_argument("--email", help="完整邮箱（精确匹配，区分大小写）")
     parser_list.add_argument(
         "--format", default="json", help="输出格式：json（默认）或 csv"
+    )
+    parser_list.add_argument(
+        "--limit", help="最多返回的条数（正整数；省略时返回全部匹配记录）"
     )
     parser_list.set_defaults(func=cmd_list)
 
