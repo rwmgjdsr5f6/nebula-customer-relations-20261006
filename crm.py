@@ -248,7 +248,39 @@ def cmd_delete(args):
     return 0
 
 
+def csv_field(value):
+    """按 RFC 4180 最小转义规则编码单个 CSV 字段。
+
+    仅当字段包含逗号、双引号、回车或换行时才用双引号包裹，
+    内部双引号写成两个；其余字段保持原值、不加引号。
+    """
+    if any(ch in value for ch in (",", '"', "\r", "\n")):
+        return '"' + value.replace('"', '""') + '"'
+    return value
+
+
+def render_csv(rows):
+    """将联系人行渲染为 CSV：固定表头，记录按给定顺序排列，行尾均为 CRLF。"""
+    lines = ["id,name,email,company"]
+    for contact_id, name, email, company in rows:
+        lines.append(
+            ",".join(
+                [
+                    str(contact_id),
+                    csv_field(name),
+                    csv_field(email),
+                    csv_field(company),
+                ]
+            )
+        )
+    return "\r\n".join(lines) + "\r\n"
+
+
 def cmd_list(args):
+    output_format = args.format
+    if output_format not in ("json", "csv"):
+        fail("format", "must be json or csv")
+
     company = clean(args.company)
     if not company:
         fail("company", "must not be empty")
@@ -286,6 +318,11 @@ def cmd_list(args):
     finally:
         conn.close()
 
+    if output_format == "csv":
+        # UTF-8 无 BOM；无匹配时只输出表头
+        sys.stdout.write(render_csv(rows))
+        return 0
+
     records = [
         {"id": row[0], "name": row[1], "email": row[2], "company": row[3]}
         for row in rows
@@ -310,6 +347,11 @@ def build_parser():
     parser_list.add_argument("--company", required=True, help="公司名")
     parser_list.add_argument("--name", help="姓名子串（字面子串匹配，区分大小写）")
     parser_list.add_argument("--email", help="完整邮箱（精确匹配，区分大小写）")
+    parser_list.add_argument(
+        "--format",
+        default="json",
+        help="输出格式：json（默认）或 csv",
+    )
     parser_list.set_defaults(func=cmd_list)
 
     parser_get = subparsers.add_parser("get", help="按编号查看联系人")
