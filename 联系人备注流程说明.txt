@@ -1,0 +1,466 @@
+联系人备注流程说明（add-note / list-notes）——源码核对说明
+==========================================================
+
+本文只解释 crm.py 中一条既有流程：按联系人编号追加文本备注
+（add-note）与在后续调用中查询同一联系人的全部备注（list-notes）。
+固定样例围绕父目录已存在的全新数据库 ../demo.sqlite3 展开：先用现有
+add 入口准备星河科技的林宁、远帆咨询的周岚两名联系人，再交替追加
+三条备注并独立查询。
+
+依据与标注约定：
+
+- 文中结论均来自对当前仓库源码 crm.py 与既有备注回归测试
+  tests/test_note_flow.py 的阅读，引用格式为"相对路径:行号"，
+  例如 crm.py:388 指 crm.py 第 388 行。
+- 文中所有命令输出均为依据源码推导、并已按源码逐条核对的"预期
+  结果"，不是新的实测留档；tests/test_note_flow.py 以子进程方式
+  固定了同样的期望（测试运行方式见该文件 tests/test_note_flow.py:25：
+  在项目根目录执行 python -m unittest discover -s tests），可用
+  测试自行复核。
+- 本次仅交付本文档。crm.py 产品代码、tests/ 现有测试、README.md、
+  数据库（contacts/notes 两表）格式以及 add、get、list、
+  update-*、delete、company-summary 等全部公开入口的现有行为均
+  保持不变；样例中的 add、list 仅用于准备数据与核对备注操作未
+  改动联系人资料。
+
+
+一、入口与参数解析
+------------------
+
+1. 两个备注子命令在模块文档字符串中即与其他入口一并声明
+   （crm.py:15-16）：add-note 按编号追加一条文本备注，list-notes
+   按编号列出全部备注（按备注编号升序）。
+
+2. --db 是顶层解析器的必填参数（crm.py:441），必须写在子命令
+   之前，即：
+
+       python crm.py --db ../demo.sqlite3 add-note ...
+
+   写成 add-note --db ... 会被 argparse 拒绝。add-note 子解析器
+   要求 --id 与 --text 两个参数（crm.py:501-504），list-notes 只
+   要求 --id（crm.py:506-510）；两者均未给参数指定 type，argparse
+   原样把字符串交给处理函数，去空白与编号校验全部发生在业务代码中。
+
+3. main()（crm.py:515-518）先 parser.parse_args(argv)
+   （crm.py:517），再 args.func(args)（crm.py:518）分派到
+   cmd_add_note 或 cmd_list_notes；脚本入口 sys.exit(main())
+   （crm.py:521-522）使处理函数的返回值成为进程退出码（成功均
+   返回 0，见 crm.py:410、crm.py:436）。测试的子进程调用助手把
+   --db 固定放在子命令之前（tests/test_note_flow.py:84-89）。
+
+
+二、编号与正文的清理、校验（均先于数据库访问）
+------------------------------------------------
+
+两个入口的第一步都是解析联系人编号：
+
+    contact_id = parse_contact_id(args.id)
+
+见 cmd_add_note（crm.py:388）与 cmd_list_notes（crm.py:415）。
+parse_contact_id()（crm.py:87-89）转调
+parse_positive_int(raw_value, "id")（crm.py:62-84）：
+
+1. clean() 只做 value.strip()（crm.py:57-59）：去掉首尾空白（空格、
+   制表符等），保留内部一切字符。因此 "  001  " 先变为 "001"。
+
+2. 非空且每个字符都是 ASCII 数字（crm.py:71）：
+   all("0" <= ch <= "9" for ch in raw_text)。这是逐字符的 ASCII
+   范围比较，只认 "0" 至 "9"；清理后为空、或含字母、负号、小数点、
+   全角数字（如 "１"，U+FF11）等任何非 ASCII 数字字符，都在
+   crm.py:72 调用 fail("id", "must be a positive integer")。
+
+3. raw_text.lstrip("0") 剥离前导零（crm.py:74），允许任意数量的
+   前导零："001"、"  0001  " 清理后都等价于整数 1。
+
+4. 取值范围（crm.py:75-83）。上限常量 MAX_CONTACT_ID =
+   9223372036854775807（crm.py:46，即 64 位有符号整数上限）：
+   剥离前导零后为空（"0"、"000"）拒绝；有效位数超过 19 位拒绝；
+   恰好 19 位时按字符串字典序与 "9223372036854775807"
+   （crm.py:47）比较，更大则拒绝，所以 "9223372036854775808"
+   被拒、"9223372036854775807" 本身通过；通过后才调用 int()
+   （crm.py:84）。
+
+综上，合法联系人编号为整数 1 至 9223372036854775807，允许首尾
+空白与任意前导零，且只允许 ASCII 数字。测试用 INVALID_IDS
+（tests/test_note_flow.py:54-63）固定了 0、abc、12x、-1、1.5、
+纯空白、9223372036854775808、以及 5000 位超长数字串等非法样例，
+两个入口均拒绝（tests/test_note_flow.py:353-374）；补零与首尾
+空白命中同一联系人由 tests/test_note_flow.py:310-349 固定。
+
+add-note 还要校验正文，且编号先于正文（crm.py:388-391）：
+
+    text = clean(args.text)          # crm.py:389，仅 strip()
+    if not text:
+        fail("text", "must not be empty")   # crm.py:390-391
+
+- 正文只去首尾空白，内部空格、制表符、换行以及中文一律保留
+  （clean() 实现就是 str.strip，crm.py:57-59）。原始输入
+  "  首次联系  " 存储与输出均为 "首次联系"；而形如
+  "  首行  内有空格\n次行\t制表  " 的正文存储为
+  "首行  内有空格\n次行\t制表"（内部双空格、换行、制表符都在，
+  测试用更长的含中文、内部空格与换行的原始串固定这一点，见
+  tests/test_note_flow.py:69-74、257-267）。
+- 清理后为空串（""、"   "、"\t\t"、" \n\t "）即报
+  text: must not be empty，见 BLANK_TEXTS
+  （tests/test_note_flow.py:66）与用例
+  tests/test_note_flow.py:376-386。
+- 编号与正文同时无效时，因为编号解析在前（crm.py:388 先于
+  crm.py:389-391），只报编号错误；用例
+  tests/test_note_flow.py:388-404 固定了 ("0","   ")、
+  ("abc","")、超长数字配纯空白、("-1","\t\t") 四组组合。
+
+fail()（crm.py:51-54）把 "字段: 消息" 一行打印到标准错误
+（crm.py:53，print 自带换行）并 sys.exit(2)（crm.py:54），
+标准输出不写任何内容。上述编号与正文校验全部发生在
+connect_db()（add-note 在 crm.py:393）之前，因此输入被拒时
+根本不访问数据库（建库边界见第五节）。
+
+
+三、数据库访问与两表结构
+------------------------
+
+校验通过后才调用 connect_db(args.db)（crm.py:393、crm.py:417，
+实现见 crm.py:107-115）：
+
+1. 父目录检查（crm.py:109）：Path(db_path).parent.is_dir() 为假
+   时，crm.py:110 调用 fail("db", "parent directory does not
+   exist")，退出码 2；此时 sqlite3.connect() 尚未执行
+   （crm.py:111），程序不会代为创建目录或文件。
+   对应 tests/test_note_flow.py:423-437。
+
+2. 连接并初始化（crm.py:111-114）：父目录存在时
+   sqlite3.connect(db_path) 打开文件（不存在则新建，已存在则
+   复用），随后各执行一次 CREATE TABLE IF NOT EXISTS 并提交：
+   contacts 表（CREATE_TABLE_SQL，crm.py:28-35，id 为
+   INTEGER PRIMARY KEY AUTOINCREMENT）与 notes 表
+   （CREATE_NOTES_TABLE_SQL，crm.py:37-43）：
+
+       id         INTEGER PRIMARY KEY AUTOINCREMENT
+       contact_id INTEGER NOT NULL
+       text       TEXT NOT NULL
+
+   已有数据库、已有两表及其中记录原样保留。
+
+备注编号是 notes 表自身的全局自增主键，与联系人编号是两套序列：
+不同联系人的备注共享同一个递增序列。样例中三条备注按追加先后
+得到 1、2、3（见第四节），而它们各自的 contact_id 指向联系人
+编号 1 或 2。
+
+
+四、add-note 的执行顺序与输出
+-----------------------------
+
+cmd_add_note()（crm.py:382-410）在 connect_db 之后、try/finally
+中依次执行：
+
+1. 核对联系人存在（crm.py:395-399）：参数化语句
+       SELECT id FROM contacts WHERE id = ?
+   fetchone()；row is None 时 fail("id", "contact not found")
+   （crm.py:398-399）。合法但库中不存在的编号（如 99）走此分支，
+   对应 tests/test_note_flow.py:408-421。
+
+2. 插入备注（crm.py:400-403）：
+       INSERT INTO notes (contact_id, text) VALUES (?, ?)
+   写入清理后的 contact_id 与 text；插入不做任何去重——即使同一
+   联系人已存在相同正文，也照样插入一条新记录、取得新的自增编号。
+   "相同正文产生不同记录"由 tests/test_note_flow.py:269-277
+   固定（两条 text 相等、id 不等、contact_id 相同）。
+
+3. 提交并关闭（crm.py:404-406）：conn.commit() 后在 finally 中
+   conn.close()。每条命令都是独立 Python 进程（测试逐次子进程
+   执行，tests/test_note_flow.py:84-89），因为提交发生在进程结束
+   之前，后续新的 list-notes 进程打开同一文件即可读到这些备注。
+
+4. 成功输出（crm.py:408-410）：用 cursor.lastrowid 取回新备注
+   编号，组装只含 id、contact_id、text 三个字段的字典，以
+   print(json.dumps(record, ensure_ascii=False)) 输出单个 JSON
+   对象（中文不转义），返回 0，标准错误为空。字段集合由
+   tests/test_note_flow.py:121-136 的断言助手固定。
+
+备注操作只读 contacts 表核对存在（SELECT id）、只写 notes 表，
+不执行任何 contacts 表的 UPDATE/DELETE，因此联系人资料与数量
+不变；该结论由 tests/test_note_flow.py:306-308 与
+tests/test_note_flow.py:349 的核对固定（追加备注后按公司 list
+与按编号 get 的结果与追加前一致）。
+
+
+五、list-notes 的执行顺序与输出
+-------------------------------
+
+cmd_list_notes()（crm.py:413-436）：
+
+1. 先 parse_contact_id（crm.py:415），再 connect_db（crm.py:417）。
+2. 先核对联系人存在（crm.py:419-423）：SELECT id ... fetchone()，
+   不存在同样 fail("id", "contact not found")（crm.py:422-423）。
+   注意：这是"联系人不存在"的错误；联系人存在但没有任何备注属于
+   正常情况，见下条。
+3. 查询该联系人的全部备注（crm.py:424-428）：
+       SELECT id, contact_id, text FROM notes
+       WHERE contact_id = ? ORDER BY id ASC
+   只取归属该联系人的备注（不会混入其他联系人的备注），并按备注
+   编号 id 升序排列。
+4. 每行组装为 id/contact_id/text 字典并以 JSON 数组打印
+   （crm.py:432-435），返回 0、标准错误为空。没有备注时行集合
+   为空，输出就是空数组 []（单行加换行），由
+   tests/test_note_flow.py:212-221 固定；升序与不串号由
+   tests/test_note_flow.py:281-304 固定。
+
+
+六、固定样例：全新 ../demo.sqlite3 上的完整命令与预期结果
+----------------------------------------------------------
+
+【说明】以下输出全部为预期结果。前提：在 crm.py 所在目录（仓库
+根目录）执行；父目录 ../ 已存在，而 ../demo.sqlite3 事先不存在
+（全新数据库），由第一条 add 自动初始化（*.sqlite3 已被
+.gitignore 忽略，不会进入版本控制）。联系人编号 1、2 与备注编号
+1、2、3 都依赖这次全新库按序插入；复用旧库时编号可能不同，应以
+各次输出对象中的 id 为准。
+
+准备 1) 新增星河科技的林宁（现有 add 入口）
+
+    python crm.py --db ../demo.sqlite3 add --name 林宁 --email lin@example.test --company 星河科技
+
+   预期结果：退出码 0，标准错误为空，标准输出一行（cmd_add，
+   crm.py:140-146）：
+
+    {"id": 1, "name": "林宁", "email": "lin@example.test", "company": "星河科技"}
+
+准备 2) 新增远帆咨询的周岚
+
+    python crm.py --db ../demo.sqlite3 add --name 周岚 --email zhou@example.test --company 远帆咨询
+
+   预期结果：退出码 0，标准错误为空，标准输出一行：
+
+    {"id": 2, "name": "周岚", "email": "zhou@example.test", "company": "远帆咨询"}
+
+   此时两名联系人都还没有备注，list-notes 对两人均返回空数组
+   （退出码 0，标准错误为空）：
+
+    python crm.py --db ../demo.sqlite3 list-notes --id 1
+    python crm.py --db ../demo.sqlite3 list-notes --id 2
+
+   两次的预期标准输出均为：
+
+    []
+
+追加 1) 给林宁追加"  首次联系  "（首尾各两个空格，需在 shell
+中加引号；清理后正文为"首次联系"）
+
+    python crm.py --db ../demo.sqlite3 add-note --id 1 --text "  首次联系  "
+
+   预期结果：退出码 0，标准错误为空，标准输出为单个备注对象，
+   备注编号 1，contact_id 即联系人编号 1：
+
+    {"id": 1, "contact_id": 1, "text": "首次联系"}
+
+追加 2) 给周岚追加"等待回复"
+
+    python crm.py --db ../demo.sqlite3 add-note --id 2 --text "等待回复"
+
+   预期结果：退出码 0，标准错误为空，标准输出一行（备注编号 2，
+   contact_id 为联系人编号 2）：
+
+    {"id": 2, "contact_id": 2, "text": "等待回复"}
+
+追加 3) 再给林宁追加"首次联系"（正文与第 1 条清理后相同）
+
+    python crm.py --db ../demo.sqlite3 add-note --id 1 --text "首次联系"
+
+   预期结果：退出码 0，标准错误为空，标准输出一行。备注编号接续
+   上一条为 3（notes.id 全局自增，不因联系人不同而重置），
+   contact_id 仍为 1；正文相同不影响插入，得到的是独立新记录：
+
+    {"id": 3, "contact_id": 1, "text": "首次联系"}
+
+独立查询 1) 再次查询林宁（一次全新的命令调用，只读，退出码 0、
+标准错误为空）：
+
+    python crm.py --db ../demo.sqlite3 list-notes --id 1
+
+   预期标准输出：只返回备注 1、3（不含周岚的备注 2），按备注编号
+   升序：
+
+    [{"id": 1, "contact_id": 1, "text": "首次联系"}, {"id": 3, "contact_id": 1, "text": "首次联系"}]
+
+独立查询 2) 查询周岚：
+
+    python crm.py --db ../demo.sqlite3 list-notes --id 2
+
+   预期标准输出：只返回备注 2：
+
+    [{"id": 2, "contact_id": 2, "text": "等待回复"}]
+
+样例要点（均有源码依据）：
+
+- --db 始终位于子命令之前（crm.py:441）。
+- 备注编号依次为 1、2、3，来自 notes.id 的 AUTOINCREMENT
+  （crm.py:37-43）与 cursor.lastrowid（crm.py:408）；输出对象的
+  contact_id 就是被追加/查询的联系人编号（crm.py:408、432-434）。
+- 相同正文"首次联系"产生编号 1、3 两条独立记录：INSERT 不做
+  存在性或去重判断（crm.py:400-403）。
+- 正文仅去首尾空白（crm.py:57-59、389）；内部空格、换行与中文
+  原样保留。
+- 追加备注不改变联系人资料与数量：整条 cmd_add_note 对 contacts
+  只有 SELECT id（crm.py:395-397）。可用现有入口复核，两人的
+  资料仍是准备阶段的样子：
+
+    python crm.py --db ../demo.sqlite3 list
+
+  预期标准输出：
+
+    [{"id": 1, "name": "林宁", "email": "lin@example.test", "company": "星河科技"}, {"id": 2, "name": "周岚", "email": "zhou@example.test", "company": "远帆咨询"}]
+
+- 已有联系人没有备注时 list-notes 返回 []（见本准备阶段的两次
+  查询；crm.py:424-435）。
+
+
+七、编号/正文写法、四类失败契约与建库边界
+------------------------------------------
+
+两个入口都接受编号带首尾空白与前导零，且编号只允许 ASCII 数字，
+合法取值为 1 至 9223372036854775807（crm.py:62-84）。例如下列
+list-notes 写法都与 --id 1 等价，预期输出与第四节中林宁的查询
+结果相同（备注 1、3）：
+
+    python crm.py --db ../demo.sqlite3 list-notes --id "  001  "
+    python crm.py --db ../demo.sqlite3 list-notes --id "0001"
+
+add-note 的 --id 同样接受这些写法：用 "  001  " 之类编号追加备注
+与用 1 追加完全等价，写入对象的 contact_id 规范化为 1
+（tests/test_note_flow.py:310-325）。
+
+四个错误信息逐字如下，均退出码 2、标准输出为空、标准错误恰为
+对应一行加换行（无 Traceback；统一由 fail() 保证
+crm.py:51-54，断言助手 assert_rejected 固定
+tests/test_note_flow.py:147-154）：
+
+  情形                         适用入口    标准错误唯一一行
+  ---------------------------  ----------  ------------------------------------------
+  编号非法（空、0、非 ASCII    两者        id: must be a positive integer
+  数字、负数、小数、超上限）    （crm.py:72、83）
+  正文为空或纯空白             add-note    text: must not be empty
+                               （crm.py:391）
+  编号合法但联系人不存在       两者        id: contact not found
+  （如 99）                    （crm.py:399、423）
+  --db 父目录不存在            两者        db: parent directory does not exist
+                               （crm.py:110）
+
+编号与正文同时无效时只报编号（编号校验先于正文，crm.py:388-391；
+tests/test_note_flow.py:388-404）：
+
+    python crm.py --db ../demo.sqlite3 add-note --id 0 --text "   "
+
+   预期：退出码 2，标准输出为空，标准错误一行：
+
+    id: must be a positive integer
+
+非法编号与正文空白的单行示例（预期分别为 id: must be a
+positive integer 与 text: must not be empty）：
+
+    python crm.py --db ../demo.sqlite3 add-note --id "9223372036854775808" --text x
+    python crm.py --db ../demo.sqlite3 list-notes --id "１"
+    python crm.py --db ../demo.sqlite3 add-note --id 1 --text "   "
+
+合法编号但联系人不存在（两个入口同样报错）：
+
+    python crm.py --db ../demo.sqlite3 add-note --id 99 --text x
+    python crm.py --db ../demo.sqlite3 list-notes --id 99
+
+   预期标准错误均为：
+
+    id: contact not found
+
+输入合法但数据库父目录不存在（两个入口同样报错）：
+
+    python crm.py --db ../no-such-dir/demo.sqlite3 add-note --id 1 --text x
+    python crm.py --db ../no-such-dir/demo.sqlite3 list-notes --id 1
+
+   预期标准错误均为：
+
+    db: parent directory does not exist
+
+两种"新数据库"结果必须区分：
+
+1. 输入校验失败（编号非法，或 add-note 正文为空/纯空白，或两者
+   皆有问题）：校验全部先于 connect_db（crm.py:388-391 先于
+   crm.py:393；list-notes 为 crm.py:415 先于 crm.py:417），文件
+   系统完全不被触碰，不存在的数据库文件不会被创建（连临时文件也
+   没有）。由 tests/test_note_flow.py:441-492 逐路径断言"执行
+   前后文件均不存在"。
+
+2. 参数合法、父目录存在、但新库中联系人不存在：connect_db 已在
+   crm.py:111-114 建库、建好 contacts 与 notes 两张空表并提交，
+   随后才在 crm.py:398-399 / 422-423 报 id: contact not found。
+   命令虽然失败，这个已初始化的空库会保留下来。由
+   tests/test_note_flow.py:494-528 固定：失败后文件存在、两表均
+   为空，随后对它执行 list 返回 []。
+
+    python crm.py --db ../fresh-empty.sqlite3 add-note --id 99 --text x
+
+   预期：退出码 2，标准输出为空，标准错误一行 id: contact not
+   found；同时 ../fresh-empty.sqlite3 被创建为含空 contacts、
+   notes 表的数据库。
+
+失败的隔离性：无论上述哪类失败，已有联系人与已有备注都不受影响
+——校验失败不触碰数据库；父目录缺失不创建任何东西；联系人不存在
+时在插入前就已退出（crm.py:398-399），不会写入备注。各失败用例
+后均有"联系人与备注快照不变"的核对
+（tests/test_note_flow.py:373-374、385-386、403-404、419-421）。
+
+成功契约小结：退出码 0、标准错误为空；add-note 标准输出为单个
+备注对象（id/contact_id/text），list-notes 标准输出为备注对象
+组成的数组（无备注时为 []）。
+
+
+八、关键结论与源码、测试用例对照表
+----------------------------------
+
+结论                                              源码                测试（tests/test_note_flow.py）
+------------------------------------------------  ------------------  ----------------------------------------
+add-note/list-notes 为既有子命令；--db 顶层必填    crm.py:15-16、      子进程调用助手（--db 在子命令前）：
+且须在子命令之前，子参数分别为 --id/--text 与     441、501-510、      84-89
+仅 --id；main 解析后分派                           515-518
+
+编号先 strip 首尾空白，只接受 ASCII 数字，        crm.py:46-48、      INVALID_IDS 54-63；
+允许前导零，取值 1 至 9223372036854775807          57-59、62-89        两个入口拒绝非法编号 353-374；
+                                                                      补零/空白命中同一联系人 310-349
+
+正文仅 strip 首尾空白，内部空格、换行、中文        crm.py:57-59、      含中文/内部空格/换行的原始串
+保留；空或纯空白报 text: must not be empty         388-391            69-74、257-267；BLANK_TEXTS 66、
+                                                                      拒绝 376-386
+
+编号与正文同时无效时先报编号                       crm.py:388 先于     组合用例 388-404
+                                                   389-391
+
+fail 统一为 stderr 一行加换行、退出码 2、          crm.py:51-54        assert_rejected 147-154
+stdout 为空、无堆栈
+
+输入校验先于 connect_db：校验失败不创建数据库      crm.py:388-393、    新库路径执行前后均不存在：
+文件，也不触碰已有记录                             415-417             441-492
+
+父目录缺失报 db: parent directory does not         crm.py:107-111      两入口均拒绝且目录/文件不被创建：
+exist，不创建目录或文件                                                423-437
+
+参数合法、父目录存在而文件不存在、联系人不存在     crm.py:111-114 配   空库保留、两表为空、随后 list 为 []：
+时，先初始化含 contacts/notes 空表的库并提交，     398-399、422-423    494-528
+再报 id: contact not found，文件保留
+
+add-note 先 SELECT id 核对联系人，不存在即失败；    crm.py:395-403      编号 99 未找到 408-421；
+INSERT 不去重，相同正文产生新编号的独立记录                            重复正文两条记录 269-277
+
+add-note 成功输出单个备注对象（id/contact_id/      crm.py:400-410      assert_add_note_success 121-136；
+text），id 取 lastrowid 全局递增，退出 0、                             交替追加与编号递增 223-255
+stderr 为空
+
+备注操作只 SELECT contacts，不改联系人资料与数量   crm.py:395-397、    追加后按公司 list / get 核对不变：
+                                                   400-403             306-308、349
+
+list-notes 联系人不存在报 id: contact not          crm.py:419-423      编号 99 两入口一致 408-421
+found；存在但无备注返回 []
+
+list-notes 仅取 WHERE contact_id = ? 且            crm.py:424-435      空数组 212-221；升序、不串号、
+ORDER BY id ASC，输出 JSON 数组，退出 0、                              两人编号集合不相交 281-304
+stderr 为空
+
+提交发生在进程结束前，后续独立进程（新的           crm.py:404-406、    每次均为独立子进程 84-89；
+list-notes 调用）能读到之前追加的备注              429-430             追加后重新查询 223-304
