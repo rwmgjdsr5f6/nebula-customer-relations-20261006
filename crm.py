@@ -14,6 +14,7 @@
 - company-summary: 按公司汇总联系人数量（JSON 数组，按公司名 Unicode 码点升序）
 - add-note:       按编号为联系人追加一条文本备注
 - list-notes:     按编号列出联系人的全部备注（按备注编号升序）
+- delete-note:    按联系人编号与备注全局编号删除单条备注
 
 数据持久化在通过 --db 指定的 SQLite 数据库文件中，
 文件不存在时自动初始化，已存在则复用。
@@ -87,6 +88,11 @@ def parse_positive_int(raw_value, field):
 def parse_contact_id(raw_value):
     """清理编号首尾空白并校验为正整数（允许前导零），返回整数编号。"""
     return parse_positive_int(raw_value, "id")
+
+
+def parse_note_id(raw_value):
+    """清理备注编号首尾空白并校验为正整数（允许前导零），返回整数编号。"""
+    return parse_positive_int(raw_value, "note-id")
 
 
 def valid_email(email):
@@ -436,6 +442,48 @@ def cmd_list_notes(args):
     return 0
 
 
+def cmd_delete_note(args):
+    """按联系人编号与备注全局编号删除单条备注。
+
+    先校验联系人编号，再校验备注编号（二者同时无效时先报联系人编号），
+    随后连接数据库并核对联系人存在，最后只在备注确实归属该联系人时
+    删除并输出被删除备注的 JSON 对象；备注不存在或属于他人时均报
+    note-id: note not found。
+    """
+    contact_id = parse_contact_id(args.id)
+    note_id = parse_note_id(args.note_id)
+
+    conn = connect_db(args.db)
+    try:
+        row = conn.execute(
+            "SELECT id FROM contacts WHERE id = ?", (contact_id,)
+        ).fetchone()
+        if row is None:
+            fail("id", "contact not found")
+        note_row = conn.execute(
+            "SELECT id, contact_id, text FROM notes"
+            " WHERE id = ? AND contact_id = ?",
+            (note_id, contact_id),
+        ).fetchone()
+        if note_row is None:
+            fail("note-id", "note not found")
+        conn.execute(
+            "DELETE FROM notes WHERE id = ? AND contact_id = ?",
+            (note_id, contact_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    record = {
+        "id": note_row[0],
+        "contact_id": note_row[1],
+        "text": note_row[2],
+    }
+    print(json.dumps(record, ensure_ascii=False))
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog="crm", description="本地客户关系管理台")
     parser.add_argument("--db", required=True, help="SQLite 数据库文件路径")
@@ -508,6 +556,15 @@ def build_parser():
     )
     parser_list_notes.add_argument("--id", required=True, help="联系人编号")
     parser_list_notes.set_defaults(func=cmd_list_notes)
+
+    parser_delete_note = subparsers.add_parser(
+        "delete-note", help="按联系人编号与备注编号删除单条备注"
+    )
+    parser_delete_note.add_argument("--id", required=True, help="联系人编号")
+    parser_delete_note.add_argument(
+        "--note-id", required=True, help="备注自身的全局编号"
+    )
+    parser_delete_note.set_defaults(func=cmd_delete_note)
 
     return parser
 
